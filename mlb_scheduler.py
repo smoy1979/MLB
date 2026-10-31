@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
 """
-MLB League-Wide Regular Season Schedule Optimizer using Google OR-Tools CP-SAT.
+MLB League-Wide Regular Season Schedule Optimizer & Historical Schedule Evaluator
+using Google OR-Tools CP-SAT.
+
+Usage:
+  1. Optimize 2027 schedule (20-minute timeout):
+     python mlb_scheduler_5.py
+
+  2. Evaluate official 2026 MLB schedule from MLB Stats API (no optimization):
+     python mlb_scheduler_5.py --evaluate-2026
+
+  3. Evaluate any existing schedule CSV file:
+     python mlb_scheduler_5.py --evaluate-csv mlb_schedule.csv --season-year 2027
 """
 
+import argparse
 import math
 import time
 import datetime
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 import requests
 import pandas as pd
 from ortools.sat.python import cp_model
@@ -16,6 +28,7 @@ from ortools.sat.python import cp_model
 # ==============================================================================
 
 MLB_API_URL = "https://statsapi.mlb.com/api/v1/teams?sportId=1&hydrate=venue(location)"
+MLB_SCHEDULE_API_URL = "https://statsapi.mlb.com/api/v1/schedule?sportId=1&season={year}&gameType=R"
 
 FALLBACK_TEAMS: List[Dict[str, Any]] = [
     # AL East
@@ -134,7 +147,7 @@ def build_distance_matrix(teams: List[Dict[str, Any]]) -> List[List[int]]:
 
 
 # ==============================================================================
-# 2. CALENDAR STRUCTURE & TIME SLOT ARCHITECTURE (DYNAMIC FOR ANY YEAR)
+# 2. CALENDAR STRUCTURE & TIME SLOT ARCHITECTURE
 # ==============================================================================
 
 def get_calendar_holidays(season_year: int) -> Dict[str, datetime.date]:
@@ -168,7 +181,10 @@ def get_calendar_holidays(season_year: int) -> Dict[str, datetime.date]:
 def build_season_slots(season_year: int = 2027) -> Tuple[List[Dict[str, Any]], Dict[str, datetime.date]]:
     """
     Constructs 52 half-week Series Slots (~26 weeks) dynamically anchored to `season_year`.
-    Guarantees all 30 teams play on Memorial Day, July 4th, and Labor Day, and blackouts ASG week.
+    - Slot 0 (Opening Weekend) uses [Thu, Sat, Sun] for 3g (traditional Friday buffer off-day)
+      and [Thu, Fri, Sat, Sun] for 4g.
+    - All other 50 active slots use strictly contiguous series dates and avoid Thursday
+      doubleheaders via `dates_3g_early` ([Mon, Tue, Wed]) when paired with a 4-game weekend.
     """
     holidays = get_calendar_holidays(season_year)
     start_date = holidays["opening_thu"]
@@ -179,22 +195,25 @@ def build_season_slots(season_year: int = 2027) -> Tuple[List[Dict[str, Any]], D
 
     slots: List[Dict[str, Any]] = []
 
-    # Slot 0: Opening Weekend (Thu - Sun)
+    # Slot 0: Opening Weekend (Thu, Sat, Sun for 3g; Thu-Sun for 4g)
     slots.append({
         "slot_idx": 0,
         "label": "W01_B_Opening",
         "slot_type": "B",
         "is_asg": False,
+        "is_post_asg": False,
         "holiday": None,
         "dates_3g": [start_date, start_date + datetime.timedelta(days=2), start_date + datetime.timedelta(days=3)],
+        "dates_3g_early": [start_date, start_date + datetime.timedelta(days=2), start_date + datetime.timedelta(days=3)],
         "dates_4g": [start_date + datetime.timedelta(days=d) for d in range(4)],
         "force_3g": False,
+        "shares_thu_with_prev": False,
     })
 
     curr_mon = start_date + datetime.timedelta(days=4)
     slot_idx = 1
 
-    # Generate 25.5 weeks (51 additional slots -> 52 slots total)
+    # Generate 25 full weeks (50 slots) + 1 Finale slot = 52 slots total
     for _ in range(25):
         tue = curr_mon + datetime.timedelta(days=1)
         wed = curr_mon + datetime.timedelta(days=2)
@@ -216,35 +235,51 @@ def build_season_slots(season_year: int = 2027) -> Tuple[List[Dict[str, Any]], D
                 "label": f"W{week_num:02d}_A_ASG_Break",
                 "slot_type": "ASG",
                 "is_asg": True,
+                "is_post_asg": False,
                 "holiday": "All-Star Break",
                 "dates_3g": [],
+                "dates_3g_early": [],
                 "dates_4g": [],
                 "force_3g": False,
+                "shares_thu_with_prev": False,
             })
         elif curr_mon in (memorial_day, labor_day):
+            # Previous weekend wrapped into Monday holiday; midweek is strictly Tue-Thu (3g only)
             slots.append({
                 "slot_idx": slot_idx,
                 "label": f"W{week_num:02d}_A",
                 "slot_type": "A",
                 "is_asg": False,
+                "is_post_asg": False,
                 "holiday": None,
                 "dates_3g": [tue, wed, thu],
-                "dates_4g": [tue, wed, thu, thu],
+                "dates_3g_early": [tue, wed, thu],
+                "dates_4g": [tue, wed, thu],
                 "force_3g": True,
+                "shares_thu_with_prev": False,
             })
         elif july_4_in_midweek:
-            d3 = sorted(list({tue, wed, july_4th}))
-            if len(d3) < 3:
+            if july_4th == curr_mon:
+                d3 = [curr_mon, tue, wed]
+                d3_early = [curr_mon, tue, wed]
+            elif july_4th == thu:
                 d3 = [tue, wed, thu]
+                d3_early = [tue, wed, thu]
+            else:
+                d3 = [tue, wed, thu]
+                d3_early = [curr_mon, tue, wed]
             slots.append({
                 "slot_idx": slot_idx,
                 "label": f"W{week_num:02d}_A_July4th",
                 "slot_type": "A",
                 "is_asg": False,
+                "is_post_asg": False,
                 "holiday": "July 4th",
                 "dates_3g": d3,
+                "dates_3g_early": d3_early,
                 "dates_4g": [curr_mon, tue, wed, thu],
                 "force_3g": False,
+                "shares_thu_with_prev": False,
             })
         else:
             slots.append({
@@ -252,24 +287,30 @@ def build_season_slots(season_year: int = 2027) -> Tuple[List[Dict[str, Any]], D
                 "label": f"W{week_num:02d}_A",
                 "slot_type": "A",
                 "is_asg": False,
+                "is_post_asg": False,
                 "holiday": None,
                 "dates_3g": [tue, wed, thu],
+                "dates_3g_early": [curr_mon, tue, wed],
                 "dates_4g": [curr_mon, tue, wed, thu],
                 "force_3g": False,
+                "shares_thu_with_prev": False,
             })
         slot_idx += 1
 
-        # --- SLOT B (Weekend: Fri-Sun or Fri-Mon Holiday Wrap) ---
+        # --- SLOT B (Weekend: Fri-Sun or Thu-Sun or Fri-Mon Holiday Wrap) ---
         if next_mon == memorial_day:
             slots.append({
                 "slot_idx": slot_idx,
                 "label": f"W{week_num:02d}_B_MemorialDay",
                 "slot_type": "B",
                 "is_asg": False,
+                "is_post_asg": False,
                 "holiday": "Memorial Day",
                 "dates_3g": [sat, sun, next_mon],
+                "dates_3g_early": [sat, sun, next_mon],
                 "dates_4g": [fri, sat, sun, next_mon],
                 "force_3g": False,
+                "shares_thu_with_prev": False,
             })
         elif next_mon == labor_day:
             slots.append({
@@ -277,10 +318,29 @@ def build_season_slots(season_year: int = 2027) -> Tuple[List[Dict[str, Any]], D
                 "label": f"W{week_num:02d}_B_LaborDay",
                 "slot_type": "B",
                 "is_asg": False,
+                "is_post_asg": False,
                 "holiday": "Labor Day",
                 "dates_3g": [sat, sun, next_mon],
+                "dates_3g_early": [sat, sun, next_mon],
                 "dates_4g": [fri, sat, sun, next_mon],
                 "force_3g": False,
+                "shares_thu_with_prev": False,
+            })
+        elif curr_mon in (memorial_day, labor_day):
+            # In a week where Monday was Memorial/Labor Day, Slot A played [Tue, Wed, Thu],
+            # so Slot B is restricted to 3-game series [Fri, Sat, Sun] to prevent Thursday collisions.
+            slots.append({
+                "slot_idx": slot_idx,
+                "label": f"W{week_num:02d}_B",
+                "slot_type": "B",
+                "is_asg": False,
+                "is_post_asg": False,
+                "holiday": None,
+                "dates_3g": [fri, sat, sun],
+                "dates_3g_early": [fri, sat, sun],
+                "dates_4g": [fri, sat, sun],
+                "force_3g": True,
+                "shares_thu_with_prev": False,
             })
         elif july_4_in_weekend:
             slots.append({
@@ -288,10 +348,13 @@ def build_season_slots(season_year: int = 2027) -> Tuple[List[Dict[str, Any]], D
                 "label": f"W{week_num:02d}_B_July4th",
                 "slot_type": "B",
                 "is_asg": False,
+                "is_post_asg": False,
                 "holiday": "July 4th",
                 "dates_3g": [fri, sat, sun],
+                "dates_3g_early": [fri, sat, sun],
                 "dates_4g": [thu, fri, sat, sun],
                 "force_3g": False,
+                "shares_thu_with_prev": (not is_asg_midweek),
             })
         else:
             slots.append({
@@ -299,10 +362,13 @@ def build_season_slots(season_year: int = 2027) -> Tuple[List[Dict[str, Any]], D
                 "label": f"W{week_num:02d}_B",
                 "slot_type": "B",
                 "is_asg": False,
+                "is_post_asg": is_asg_midweek,
                 "holiday": None,
                 "dates_3g": [fri, sat, sun],
+                "dates_3g_early": [fri, sat, sun],
                 "dates_4g": [thu, fri, sat, sun],
                 "force_3g": False,
+                "shares_thu_with_prev": (not is_asg_midweek),
             })
         slot_idx += 1
         curr_mon = next_mon
@@ -314,10 +380,13 @@ def build_season_slots(season_year: int = 2027) -> Tuple[List[Dict[str, Any]], D
         "label": "W26_B_Finale",
         "slot_type": "B",
         "is_asg": False,
+        "is_post_asg": False,
         "holiday": None,
         "dates_3g": [curr_mon + datetime.timedelta(days=4), curr_mon + datetime.timedelta(days=5), curr_mon + datetime.timedelta(days=6)],
+        "dates_3g_early": [curr_mon + datetime.timedelta(days=4), curr_mon + datetime.timedelta(days=5), curr_mon + datetime.timedelta(days=6)],
         "dates_4g": [thu, curr_mon + datetime.timedelta(days=4), curr_mon + datetime.timedelta(days=5), curr_mon + datetime.timedelta(days=6)],
         "force_3g": False,
+        "shares_thu_with_prev": False,
     })
 
     assert len(slots) == 52, f"Expected 52 slots, generated {len(slots)}"
@@ -435,17 +504,21 @@ class SolutionProgressCallback(cp_model.CpSolverSolutionCallback):
     def __init__(
         self,
         div_vars: List[Any],
-        iso_vars: List[Any],
+        iso_h_vars: List[Any],
+        iso_a_vars: List[Any],
         rt_vars: List[Any],
         miss_apr_vars: List[Any],
         miss_sep_vars: List[Any],
+        asg_thu_vars: List[Any],
     ):
         super().__init__()
         self._div_vars = div_vars
-        self._iso_vars = iso_vars
+        self._iso_h_vars = iso_h_vars
+        self._iso_a_vars = iso_a_vars
         self._rt_vars = rt_vars
         self._miss_apr_vars = miss_apr_vars
         self._miss_sep_vars = miss_sep_vars
+        self._asg_thu_vars = asg_thu_vars
         self._start_time = time.time()
         self._solution_count = 0
 
@@ -455,16 +528,19 @@ class SolutionProgressCallback(cp_model.CpSolverSolutionCallback):
         obj = self.ObjectiveValue()
         bound = self.BestObjectiveBound()
         div_cnt = sum(self.Value(v) for v in self._div_vars)
-        iso_cnt = sum(self.Value(v) for v in self._iso_vars)
+        iso_h = sum(self.Value(v) for v in self._iso_h_vars)
+        iso_a = sum(self.Value(v) for v in self._iso_a_vars)
         rt_cnt = sum(self.Value(v) for v in self._rt_vars)
         m_apr = sum(self.Value(v) for v in self._miss_apr_vars)
         m_sep = sum(self.Value(v) for v in self._miss_sep_vars)
+        asg_thu = sum(self.Value(v) for v in self._asg_thu_vars)
         print(
             f"  [Solution #{self._solution_count:02d} @ {elapsed:6.1f}s] "
             f"Obj: {obj:8.0f} (Bound: {bound:8.0f}) | "
-            f"Missed Apr/Sep Pairs: {m_apr:2d}/{m_sep:2d} | "
+            f"Miss Apr/Sep: {m_apr:2d}/{m_sep:2d} | "
+            f"1-Ser H/A: {iso_h:2d}/{iso_a:2d} | "
+            f"ASG Thu: {asg_thu:2d} | "
             f"Early/Late Div: {div_cnt:3d} | "
-            f"1-Series Home: {iso_cnt:2d} | "
             f"Road Trips: {rt_cnt:3d}"
         )
 
@@ -474,15 +550,18 @@ def solve_schedule_slots(
     slots: List[Dict[str, Any]],
     series_list: List[Dict[str, Any]],
     dist_matrix: List[List[int]],
-    timeout_sec: int = 300,
+    timeout_sec: int = 1200,
     season_year: int = 2027,
     num_workers: int = 12,
     verbose_solver_logs: bool = True,
 ) -> Tuple[Dict[int, int], Dict[str, Any]]:
     """
     Phase 2 CP-SAT Model:
-    Assigns all 765 series to the 51 active half-week slots with soft penalties
-    for unaccommodated April/September divisional opponents.
+    Assigns all 765 series to the 51 active half-week slots with:
+      - Hard no-doubleheader constraints (at most one 4-game series per team in any Mon-Sun week).
+      - Hard maximum 3 consecutive Home series and maximum 3 consecutive Away series.
+      - Soft penalties for 1-series road trips, 1-series homestands, missed April/September
+        divisional opponents, and All-Star Thursday games.
     """
     print("\nPhase 2: Building CP-SAT slot assignment and road-trip routing model...")
     t0 = time.time()
@@ -491,15 +570,11 @@ def solve_schedule_slots(
     active_slots = [s["slot_idx"] for s in slots if not s["is_asg"]]
     n_active = len(active_slots)  # 51 active slots
 
-    # Target April (<= Apr 30) and September (>= Sep 1) windows for soft divisional spacing
     april_cutoff = datetime.date(season_year, 4, 30)
     sept_cutoff = datetime.date(season_year, 9, 1)
 
     april_slots = [s["slot_idx"] for s in slots if not s["is_asg"] and s["dates_3g"][0] <= april_cutoff]
     sept_slots = [s["slot_idx"] for s in slots if not s["is_asg"] and s["dates_3g"][-1] >= sept_cutoff]
-
-    if not april_slots or not sept_slots:
-        raise ValueError(f"Empty April ({len(april_slots)}) or Sept ({len(sept_slots)}) slots for year {season_year}")
 
     first_4w_slots = active_slots[:8]
     final_4w_slots = active_slots[-8:]
@@ -534,11 +609,16 @@ def solve_schedule_slots(
 
     home_series_by_team = {t: [] for t in range(n_teams)}
     away_series_by_team = {t: [] for t in range(n_teams)}
+    four_game_series_by_team = {t: [] for t in range(n_teams)}
     pair_series = {}
+
     for sid, sr in enumerate(series_list):
         h, a = sr["home"], sr["away"]
         home_series_by_team[h].append(sid)
         away_series_by_team[a].append(sid)
+        if sr["games"] == 4:
+            four_game_series_by_team[h].append(sid)
+            four_game_series_by_team[a].append(sid)
         pair_key = (min(h, a), max(h, a))
         pair_series.setdefault(pair_key, []).append(sid)
 
@@ -551,6 +631,17 @@ def solve_schedule_slots(
             model.AddExactlyOne(h_vars + a_vars)
             model.Add(sum(h_vars) == is_home[t, k])
 
+    # 1b. HARD NO-DOUBLEHEADER CONSTRAINT:
+    # A team cannot play two 4-game series in the same standard 7-day Mon-Sun week.
+    for s_b in active_slots:
+        if slots[s_b].get("shares_thu_with_prev", False):
+            s_a = s_b - 1
+            if s_a in active_slots:
+                for t in range(n_teams):
+                    f4_a = [x[sid, s_a] for sid in four_game_series_by_team[t]]
+                    f4_b = [x[sid, s_b] for sid in four_game_series_by_team[t]]
+                    model.Add(sum(f4_a + f4_b) <= 1)
+
     # 2. Divisional Spacing Constraints (SOFT <= April 30 and >= September 1 with penalty slacks)
     missed_april_vars = []
     missed_sept_vars = []
@@ -561,7 +652,6 @@ def solve_schedule_slots(
             miss_apr = model.NewBoolVar(f"miss_apr_{t1}_{t2}")
             miss_sep = model.NewBoolVar(f"miss_sep_{t1}_{t2}")
 
-            # Soft lower bound: either >= 1 series is scheduled in the window, or miss_* == 1
             model.Add(sum(x[sid, s] for sid in sids for s in april_slots) + miss_apr >= 1)
             model.Add(sum(x[sid, s] for sid in sids for s in sept_slots) + miss_sep >= 1)
 
@@ -574,25 +664,46 @@ def solve_schedule_slots(
                 s_curr, s_next = active_slots[k], active_slots[k + 1]
                 model.Add(sum(x[sid, s_curr] + x[sid, s_next] for sid in sids) <= 1)
 
-    # 3. Road Trip & Homestand Length Constraints (Hard)
+    # 3. Road Trip & Homestand Length Constraints (Hard Max 3; Soft Min 2)
     isolated_home_vars = []
+    isolated_away_vars = []
+
     for t in range(n_teams):
+        # Hard Max 3 consecutive Home series and Max 3 consecutive Away series
         for k in range(n_active - 3):
             window = [is_home[t, k + d] for d in range(4)]
             model.Add(sum(window) <= 3)  # Max 3 consecutive Home series
             model.Add(sum(window) >= 1)  # Max 3 consecutive Away series
 
-        # Min 2 consecutive Away series (forbid isolated 1-series road trips)
-        # model.Add(is_home[t, 0] + (1 - is_home[t, 1]) >= 1)
-        # model.Add(is_home[t, n_active - 1] + (1 - is_home[t, n_active - 2]) >= 1)
-        # for k in range(1, n_active - 1):
-        #     model.Add(is_home[t, k - 1] + (1 - is_home[t, k]) + is_home[t, k + 1] <= 2)
+        # Soft 1-series road trip at start of season (Away in Slot 0, Home in Slot 1)
+        iso_a_start = model.NewBoolVar(f"iso_a_start_{t}")
+        model.Add(iso_a_start >= is_home[t, 1] - is_home[t, 0])
+        isolated_away_vars.append(iso_a_start)
 
-        #     iso_h = model.NewBoolVar(f"iso_h_{t}_{k}")
-        #     model.Add(iso_h >= is_home[t, k] - is_home[t, k - 1] - is_home[t, k + 1])
-        #     isolated_home_vars.append(iso_h)
+        # Soft 1-series road trip at end of season (Home in Slot 49, Away in Slot 50)
+        iso_a_end = model.NewBoolVar(f"iso_a_end_{t}")
+        model.Add(iso_a_end >= is_home[t, n_active - 2] - is_home[t, n_active - 1])
+        isolated_away_vars.append(iso_a_end)
 
-    # 4. Multi-Objective Formulation
+        # Interior slots (1 .. n_active - 2): track both A - H - A (1-series homestand) and H - A - H (1-series road trip)
+        for k in range(1, n_active - 1):
+            iso_h = model.NewBoolVar(f"iso_h_{t}_{k}")
+            model.Add(iso_h >= is_home[t, k] - is_home[t, k - 1] - is_home[t, k + 1])
+            isolated_home_vars.append(iso_h)
+
+            iso_a = model.NewBoolVar(f"iso_a_{t}_{k}")
+            model.Add(iso_a >= is_home[t, k - 1] - is_home[t, k] + is_home[t, k + 1] - 1)
+            isolated_away_vars.append(iso_a)
+
+    # 4. Soft Penalty for scheduling 4-game series in the post-All-Star Weekend slot
+    asg_thursday_4g_vars = []
+    post_asg_slots = [s["slot_idx"] for s in slots if s.get("is_post_asg", False)]
+    for s_post in post_asg_slots:
+        for sid, sr in enumerate(series_list):
+            if sr["games"] == 4:
+                asg_thursday_4g_vars.append(x[sid, s_post])
+
+    # 5. Multi-Objective Formulation
     div_early_late_terms = []
     for sid, sr in enumerate(series_list):
         if sr["is_div"]:
@@ -606,29 +717,32 @@ def solve_schedule_slots(
             model.Add(rt_start >= is_home[t, k - 1] - is_home[t, k])
             road_trip_starts.append(rt_start)
 
-    # Each missed divisional pair means 2 teams missed that opponent in April/Sept (-1000 per pair = -500 per team-opponent)
     model.Maximize(
         100 * sum(div_early_late_terms)
         - 250 * sum(isolated_home_vars)
+        - 300 * sum(isolated_away_vars)
         - 50 * sum(road_trip_starts)
-        - 10 * sum(missed_april_vars)
-        - 10 * sum(missed_sept_vars)
+        - 500 * sum(missed_april_vars)
+        - 500 * sum(missed_sept_vars)
+        - 150 * sum(asg_thursday_4g_vars)
     )
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(timeout_sec)
     solver.parameters.num_search_workers = num_workers
     solver.parameters.log_search_progress = verbose_solver_logs
-    solver.parameters.relative_gap_limit = 0.02
+    solver.parameters.relative_gap_limit = 0.01
 
     callback = SolutionProgressCallback(
         div_early_late_terms,
         isolated_home_vars,
+        isolated_away_vars,
         road_trip_starts,
         missed_april_vars,
         missed_sept_vars,
+        asg_thursday_4g_vars,
     )
-    print(f"Solving Phase 2 (workers={num_workers}, max_time={timeout_sec}s, gap_limit=2%)...")
+    print(f"Solving Phase 2 (workers={num_workers}, max_time={timeout_sec}s, gap_limit=1%)...")
     status = solver.Solve(model, callback)
     solve_time = time.time() - t0
 
@@ -647,17 +761,20 @@ def solve_schedule_slots(
 
     missed_apr_pairs = [f"{a}-{b}" for a, b, ma, _ in div_pair_meta if solver.Value(ma) == 1]
     missed_sep_pairs = [f"{a}-{b}" for a, b, _, ms in div_pair_meta if solver.Value(ms) == 1]
+    asg_thu_count = sum(solver.Value(v) for v in asg_thursday_4g_vars)
 
     metrics = {
         "status": status_name,
         "solve_time_sec": round(solve_time, 2),
         "objective_value": solver.ObjectiveValue(),
         "isolated_homestands": sum(solver.Value(v) for v in isolated_home_vars),
+        "isolated_road_trips": sum(solver.Value(v) for v in isolated_away_vars),
         "early_late_div_series": sum(solver.Value(v) for v in div_early_late_terms),
         "missed_april_pairs": len(missed_apr_pairs),
         "missed_sept_pairs": len(missed_sep_pairs),
         "missed_april_list": missed_apr_pairs,
         "missed_sept_list": missed_sep_pairs,
+        "asg_thursday_games": asg_thu_count,
     }
     return assignment, metrics
 
@@ -670,9 +787,7 @@ def optimize_away_leg_ordering(
     dist_matrix: List[List[int]],
     season_year: int = 2027,
 ) -> Dict[int, int]:
-    """
-    Computes initial sequential venue-to-venue travel distance across all 30 teams.
-    """
+    """Computes initial sequential venue-to-venue travel distance across all 30 teams."""
     n_teams = len(teams)
     active_slots = [s["slot_idx"] for s in slots if not s["is_asg"]]
 
@@ -710,6 +825,9 @@ def expand_to_daily_schedule(
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """
     Expands the solved series-to-slot assignment into 2,430 individual game records.
+    Automatically shifts a 3-game midweek Slot A series to [Mon, Tue, Wed] whenever
+    either participating team plays a 4-game weekend Slot B series starting on Thursday,
+    guaranteeing zero Thursday doubleheaders.
     """
     n_teams = len(teams)
     active_slots = [s["slot_idx"] for s in slots if not s["is_asg"]]
@@ -717,6 +835,13 @@ def expand_to_daily_schedule(
     slot_series: Dict[int, List[Dict[str, Any]]] = {s: [] for s in active_slots}
     for sid, s in assignment.items():
         slot_series[s].append(series_list[sid])
+
+    teams_playing_4g_in_slot: Dict[int, set] = {s: set() for s in active_slots}
+    for s in active_slots:
+        for sr in slot_series[s]:
+            if sr["games"] == 4:
+                teams_playing_4g_in_slot[s].add(sr["home"])
+                teams_playing_4g_in_slot[s].add(sr["away"])
 
     current_venue = {t: t for t in range(n_teams)}
     team_total_miles = {teams[t]["abbr"]: 0 for t in range(n_teams)}
@@ -726,6 +851,13 @@ def expand_to_daily_schedule(
     for s in active_slots:
         slot_meta = slots[s]
         slot_label = slot_meta["label"]
+        next_s = s + 1
+        next_shares_thu = (
+            next_s < len(slots)
+            and not slots[next_s]["is_asg"]
+            and slots[next_s].get("shares_thu_with_prev", False)
+        )
+
         for sr in slot_series[s]:
             h_idx = sr["home"]
             a_idx = sr["away"]
@@ -740,13 +872,22 @@ def expand_to_daily_schedule(
             current_venue[h_idx] = h_idx
             current_venue[a_idx] = h_idx
 
-            dates = slot_meta["dates_3g"] if g_cnt == 3 else slot_meta["dates_4g"]
+            if g_cnt == 4:
+                dates = slot_meta["dates_4g"]
+            else:
+                if next_shares_thu and (
+                    h_idx in teams_playing_4g_in_slot.get(next_s, set())
+                    or a_idx in teams_playing_4g_in_slot.get(next_s, set())
+                ):
+                    dates = slot_meta.get("dates_3g_early", slot_meta["dates_3g"])
+                else:
+                    dates = slot_meta["dates_3g"]
 
             for g_num, g_date in enumerate(dates, start=1):
                 dow = g_date.strftime("%A")
                 is_final_game = (g_num == g_cnt)
                 is_day_game = bool(
-                    (is_final_game and dow in ("Monday", "Thursday")) or dow == "Sunday"
+                    (is_final_game and dow in ("Monday", "Wednesday", "Thursday")) or dow == "Sunday"
                 )
                 series_travel = (h_miles + a_miles) if g_num == 1 else 0
 
@@ -784,6 +925,30 @@ def run_validation_checks(
     assert len(df) == 2430, f"Expected 2,430 total games, got {len(df)}"
     print("[PASS] Total regular season games == 2,430")
 
+    # 1. Verify No Doubleheaders (No team plays more than 1 game on any calendar date)
+    team_dates = pd.concat([
+        df[["Date", "HomeTeam"]].rename(columns={"HomeTeam": "Team"}),
+        df[["Date", "AwayTeam"]].rename(columns={"AwayTeam": "Team"}),
+    ])
+    dups = team_dates[team_dates.duplicated(subset=["Date", "Team"], keep=False)]
+    assert len(dups) == 0, f"Found {len(dups) // 2} doubleheaders! Sample:\n{dups.head(6)}"
+    print("[PASS] Zero doubleheaders scheduled (no team plays twice on the same date)")
+
+    # 2. Verify Contiguous Series Dates (excluding Opening Weekend's traditional Friday buffer off-day)
+    df_temp = df.copy()
+    df_temp["DateObj"] = pd.to_datetime(df_temp["Date"])
+    non_contiguous = []
+    for (slot_lbl, h, a), grp in df_temp.groupby(["SeriesSlot", "HomeTeam", "AwayTeam"]):
+        if slot_lbl == "W01_B_Opening":
+            continue
+        d_list = sorted(grp["DateObj"].tolist())
+        diffs = [(d_list[i + 1] - d_list[i]).days for i in range(len(d_list) - 1)]
+        if any(d != 1 for d in diffs):
+            non_contiguous.append((slot_lbl, h, a, [d.strftime("%Y-%m-%d") for d in d_list]))
+    assert len(non_contiguous) == 0, f"Found {len(non_contiguous)} non-contiguous series: {non_contiguous[:5]}"
+    print("[PASS] All regular series after Opening Weekend have strictly contiguous calendar dates")
+
+    # 3. Verify 81 Home / 81 Away games per team
     home_counts = df["HomeTeam"].value_counts().to_dict()
     away_counts = df["AwayTeam"].value_counts().to_dict()
     for t in teams:
@@ -793,6 +958,7 @@ def run_validation_checks(
         assert hc == 81 and ac == 81, f"Team {abbr} has {hc}H / {ac}A (expected 81H / 81A)"
     print("[PASS] All 30 teams have exactly 162 games (81 Home / 81 Away)")
 
+    # 4. Verify Holiday Full-League Play
     for holiday_name, h_date_obj in [
         ("Memorial Day", holidays["memorial_day"]),
         ("July 4th", holidays["july_4th"]),
@@ -806,12 +972,19 @@ def run_validation_checks(
         )
     print("[PASS] All 30 teams play on Memorial Day, July 4th, and Labor Day")
 
+    # 5. All-Star Break Check: Hard check on Mon-Wed (July 12-14), Soft info check on Thu (July 15)
     asg_mon = holidays["asg_monday"]
     asg_wed = asg_mon + datetime.timedelta(days=2)
-    asg_games = df[(df["Date"] >= asg_mon.isoformat()) & (df["Date"] <= asg_wed.isoformat())]
-    assert len(asg_games) == 0, f"Found {len(asg_games)} games during All-Star Break!"
-    print(f"[PASS] All-Star Break ({asg_mon.isoformat()} to {asg_wed.isoformat()}) has 0 games scheduled")
+    asg_thu = asg_mon + datetime.timedelta(days=3)
+    core_asg_games = df[(df["Date"] >= asg_mon.isoformat()) & (df["Date"] <= asg_wed.isoformat())]
+    assert len(core_asg_games) == 0, f"Found {len(core_asg_games)} games during core Mon-Wed All-Star Break!"
+    thu_asg_games = df[df["Date"] == asg_thu.isoformat()]
+    print(
+        f"[PASS] Core All-Star Break ({asg_mon.isoformat()} to {asg_wed.isoformat()}) has 0 games "
+        f"(Thursday {asg_thu.isoformat()} early restart games: {len(thu_asg_games)})"
+    )
 
+    # 6. Verify Intradivision Quotas
     abbr_to_div = {t["abbr"]: t["division"] for t in teams}
     pair_games: Dict[Tuple[str, str], int] = {}
     for _, row in df.iterrows():
@@ -832,6 +1005,7 @@ def run_validation_checks(
         assert div_total == 52, f"Team {a1} played {div_total} divisional games"
     print("[PASS] All divisional quotas met (13 games per opponent; 7H/6A or 6H/7A; 52 total)")
 
+    # 7. Verify Hard Max 3 Road Trip & Homestand Lengths (and report soft 1-series road trips)
     active_slots = [s["slot_idx"] for s in slots if not s["is_asg"]]
     team_slot_ha = {t["abbr"]: {} for t in teams}
     for sid, s in assignment.items():
@@ -841,6 +1015,7 @@ def run_validation_checks(
         team_slot_ha[h_abbr][s] = "H"
         team_slot_ha[a_abbr][s] = "A"
 
+    one_series_rt_count = 0
     for t in teams:
         abbr = t["abbr"]
         seq = [team_slot_ha[abbr][s] for s in active_slots]
@@ -857,24 +1032,303 @@ def run_validation_checks(
         runs.append((curr_char, curr_len))
         for r_type, r_len in runs:
             if r_type == "A":
-                assert 2 <= r_len <= 3, f"Team {abbr} has invalid road trip of {r_len} series"
+                assert 1 <= r_len <= 3, f"Team {abbr} has road trip of {r_len} series (max 3)"
+                if r_len == 1:
+                    one_series_rt_count += 1
             else:
-                assert 1 <= r_len <= 3, f"Team {abbr} has invalid homestand of {r_len} series"
-    print("[PASS] All road trips are 2-3 series and all homestands are 1-3 series")
+                assert 1 <= r_len <= 3, f"Team {abbr} has homestand of {r_len} series (max 3)"
+    print(f"[PASS] All road trips and homestands are <= 3 series (soft 1-series road trips: {one_series_rt_count})")
+
+
+# ==============================================================================
+# 6. HISTORICAL / 2026 SCHEDULE AUDIT & OBJECTIVE SCORE EVALUATOR
+# ==============================================================================
+
+def fetch_historical_mlb_schedule(season_year: int, teams: List[Dict[str, Any]]) -> pd.DataFrame:
+    """
+    Fetches the official regular season schedule for `season_year` from the MLB Stats API
+    and converts it into the standard DataFrame schema for constraint & objective auditing.
+    """
+    url = MLB_SCHEDULE_API_URL.format(year=season_year)
+    print(f"\nFetching official {season_year} MLB regular season schedule from {url} ...")
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    dates_data = resp.json().get("dates", [])
+
+    id_to_abbr = {t["id"]: t["abbr"] for t in teams}
+    raw_games = []
+
+    for d_entry in dates_data:
+        g_date = d_entry.get("date")
+        for g in d_entry.get("games", []):
+            if g.get("gameType") != "R":
+                continue
+            status_code = g.get("status", {}).get("codedGameState", "")
+            if status_code in ("C", "D"):
+                continue
+            h_id = g.get("teams", {}).get("home", {}).get("team", {}).get("id")
+            a_id = g.get("teams", {}).get("away", {}).get("team", {}).get("id")
+            if h_id not in id_to_abbr or a_id not in id_to_abbr:
+                continue
+            raw_games.append({
+                "Date": g_date,
+                "HomeTeam": id_to_abbr[h_id],
+                "AwayTeam": id_to_abbr[a_id],
+                "DayNight": g.get("dayNight", "night"),
+            })
+
+    df_raw = pd.DataFrame(raw_games)
+    if df_raw.empty:
+        raise RuntimeError(f"No regular season games returned by MLB API for {season_year}.")
+    df_raw.sort_values(by=["Date", "HomeTeam"], inplace=True)
+    df_raw.reset_index(drop=True, inplace=True)
+    print(f"Loaded {len(df_raw):,} official regular season games for {season_year}.")
+    return df_raw
+
+
+def evaluate_existing_schedule(
+    df_input: pd.DataFrame,
+    teams: List[Dict[str, Any]],
+    dist_matrix: List[List[int]],
+    season_year: int = 2026,
+) -> None:
+    """
+    Audits any schedule DataFrame (from MLB API or CSV) without optimizing it,
+    reporting every broken constraint and calculating its exact CP-SAT objective score.
+    """
+    print("\n" + "=" * 76)
+    print(f"HISTORICAL / EXISTING SCHEDULE AUDIT REPORT (SEASON {season_year})")
+    print("=" * 76)
+
+    df = df_input.copy()
+    df["DateObj"] = pd.to_datetime(df["Date"]).dt.date
+    holidays = get_calendar_holidays(season_year)
+    abbr_to_idx = {t["abbr"]: i for i, t in enumerate(teams)}
+    abbr_to_div = {t["abbr"]: t["division"] for t in teams}
+
+    # 1. Total games & per-team H/A balance
+    total_games = len(df)
+    home_counts = df["HomeTeam"].value_counts().to_dict()
+    away_counts = df["AwayTeam"].value_counts().to_dict()
+    imbalanced_teams = []
+    for t in teams:
+        ab = t["abbr"]
+        h_c, a_c = home_counts.get(ab, 0), away_counts.get(ab, 0)
+        if h_c != 81 or a_c != 81:
+            imbalanced_teams.append(f"{ab} ({h_c}H/{a_c}A)")
+
+    # 2. Check Doubleheaders (same team playing >= 2 games on the same date)
+    team_dates = pd.concat([
+        df[["Date", "HomeTeam"]].rename(columns={"HomeTeam": "Team"}),
+        df[["Date", "AwayTeam"]].rename(columns={"AwayTeam": "Team"}),
+    ])
+    dup_rows = team_dates[team_dates.duplicated(subset=["Date", "Team"], keep=False)]
+    num_doubleheaders = len(dup_rows) // 2
+
+    # 3. Reconstruct series per team-pair
+    df_sorted = df.sort_values(by=["DateObj", "HomeTeam", "AwayTeam"]).reset_index(drop=True)
+    active_series: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    reconstructed_series: List[Dict[str, Any]] = []
+
+    for _, row in df_sorted.iterrows():
+        h, a, d = row["HomeTeam"], row["AwayTeam"], row["DateObj"]
+        key = (h, a)
+        if key in active_series and (d - active_series[key]["dates"][-1]).days <= 2:
+            active_series[key]["dates"].append(d)
+        else:
+            if key in active_series:
+                reconstructed_series.append(active_series.pop(key))
+            active_series[key] = {"home": h, "away": a, "dates": [d]}
+    for sr in active_series.values():
+        reconstructed_series.append(sr)
+
+    reconstructed_series.sort(key=lambda x: (x["dates"][0], x["home"]))
+
+    season_start = min(df["DateObj"])
+    opening_wk_cutoff = season_start + datetime.timedelta(days=4)
+
+    non_3_4_series = []
+    internal_gap_series = []
+    for sr in reconstructed_series:
+        g_len = len(sr["dates"])
+        if g_len not in (3, 4):
+            non_3_4_series.append((sr["home"], sr["away"], str(sr["dates"][0]), g_len))
+        # Exempt Opening Weekend from internal gap check
+        if sr["dates"][0] > opening_wk_cutoff:
+            diffs = [(sr["dates"][i + 1] - sr["dates"][i]).days for i in range(g_len - 1)]
+            if any(diff > 1 for diff in diffs):
+                internal_gap_series.append((sr["home"], sr["away"], [str(dt) for dt in sr["dates"]]))
+
+    # 4. Build per-team chronological series sequence
+    team_series_seq: Dict[str, List[Dict[str, Any]]] = {t["abbr"]: [] for t in teams}
+    for sr in reconstructed_series:
+        team_series_seq[sr["home"]].append({"type": "H", "venue": sr["home"], "opp": sr["away"], "start": sr["dates"][0], "end": sr["dates"][-1], "games": len(sr["dates"])})
+        team_series_seq[sr["away"]].append({"type": "A", "venue": sr["home"], "opp": sr["home"], "start": sr["dates"][0], "end": sr["dates"][-1], "games": len(sr["dates"])})
+
+    short_road_trips = 0  # 1-series road trips (soft penalty)
+    long_road_trips = 0   # >3-series road trips (hard violation)
+    long_homestands = 0   # >3-series homestands (hard violation)
+    isolated_homestands = 0
+    road_trip_starts = 0
+    team_miles: Dict[str, int] = {}
+
+    for t in teams:
+        ab = t["abbr"]
+        seq = sorted(team_series_seq[ab], key=lambda x: x["start"])
+        curr_v = abbr_to_idx[ab]
+        miles = 0
+        for item in seq:
+            next_v = abbr_to_idx[item["venue"]]
+            miles += dist_matrix[curr_v][next_v]
+            curr_v = next_v
+        team_miles[ab] = miles
+
+        for k in range(1, len(seq)):
+            if seq[k - 1]["type"] == "H" and seq[k]["type"] == "A":
+                road_trip_starts += 1
+        for k in range(1, len(seq) - 1):
+            if seq[k - 1]["type"] == "A" and seq[k]["type"] == "H" and seq[k + 1]["type"] == "A":
+                isolated_homestands += 1
+
+        if seq:
+            runs = []
+            c_type = seq[0]["type"]
+            c_len = 0
+            for item in seq:
+                if item["type"] == c_type:
+                    c_len += 1
+                else:
+                    runs.append((c_type, c_len))
+                    c_type = item["type"]
+                    c_len = 1
+            runs.append((c_type, c_len))
+            for r_type, r_len in runs:
+                if r_type == "A":
+                    if r_len == 1:
+                        short_road_trips += 1
+                    elif r_len > 3:
+                        long_road_trips += 1
+                else:
+                    if r_len > 3:
+                        long_homestands += 1
+
+    # 5. Check April (<= Apr 30) & September (>= Sep 1) Divisional Spacing & Early/Late Divisional Series
+    season_end = max(df["DateObj"])
+    early_cutoff = season_start + datetime.timedelta(days=28)
+    late_cutoff = season_end - datetime.timedelta(days=28)
+    april_cutoff = datetime.date(season_year, 4, 30)
+    sept_cutoff = datetime.date(season_year, 9, 1)
+
+    early_late_div_series = 0
+    div_pair_apr: Dict[Tuple[str, str], int] = {}
+    div_pair_sep: Dict[Tuple[str, str], int] = {}
+
+    for i in range(len(teams)):
+        for j in range(i + 1, len(teams)):
+            if teams[i]["division"] == teams[j]["division"]:
+                pk = (min(teams[i]["abbr"], teams[j]["abbr"]), max(teams[i]["abbr"], teams[j]["abbr"]))
+                div_pair_apr[pk] = 0
+                div_pair_sep[pk] = 0
+
+    for sr in reconstructed_series:
+        h, a = sr["home"], sr["away"]
+        if abbr_to_div[h] == abbr_to_div[a]:
+            pk = (min(h, a), max(h, a))
+            if sr["dates"][0] <= april_cutoff:
+                div_pair_apr[pk] += 1
+            if sr["dates"][-1] >= sept_cutoff:
+                div_pair_sep[pk] += 1
+            if sr["dates"][0] <= early_cutoff or sr["dates"][-1] >= late_cutoff:
+                early_late_div_series += 1
+
+    missed_apr_list = [f"{k[0]}-{k[1]}" for k, v in div_pair_apr.items() if v == 0]
+    missed_sep_list = [f"{k[0]}-{k[1]}" for k, v in div_pair_sep.items() if v == 0]
+
+    # 6. Check All-Star Break
+    asg_mon = holidays["asg_monday"]
+    asg_wed = asg_mon + datetime.timedelta(days=2)
+    asg_thu = asg_mon + datetime.timedelta(days=3)
+    asg_core_games = len(df[(df["DateObj"] >= asg_mon) & (df["DateObj"] <= asg_wed)])
+    asg_thu_games = len(df[df["DateObj"] == asg_thu])
+
+    # 7. Calculate Objective Score using our Phase 2 formula
+    objective_score = (
+        100 * early_late_div_series
+        - 250 * isolated_homestands
+        - 300 * short_road_trips
+        - 50 * road_trip_starts
+        - 500 * len(missed_apr_list)
+        - 500 * len(missed_sep_list)
+        - 150 * asg_thu_games
+    )
+
+    total_miles = sum(team_miles.values())
+    sorted_miles = sorted(team_miles.items(), key=lambda x: x[1], reverse=True)
+
+    print(f"Total Games Evaluated            : {total_games:,} (Target: 2,430)")
+    print(f"Total Reconstructed Series       : {len(reconstructed_series):,} (Target: 765)")
+    print("-" * 76)
+    print("HARD & SOFT CONSTRAINT AUDIT BREAKDOWN:")
+    print(f"  1. Teams off 81H/81A Balance   : {len(imbalanced_teams)} {imbalanced_teams[:6]}")
+    print(f"  2. Doubleheaders (Same Date)   : {num_doubleheaders} team-date collisions")
+    print(f"  3. Series != 3 or 4 Games      : {len(non_3_4_series)} series (e.g., 1- or 2-game series)")
+    print(f"  4. Non-Opening Series w/ Gap   : {len(internal_gap_series)} series")
+    print(f"  5. Long Road Trips (>3 series) : {long_road_trips} occurrences (Hard Constraint)")
+    print(f"  6. Long Homestands (>3 series) : {long_homestands} occurrences (Hard Constraint)")
+    print(f"  7. 1-Series Road Trips (==1)   : {short_road_trips} occurrences (Soft Penalty)")
+    print(f"  8. 1-Series Homestands (==1)   : {isolated_homestands} occurrences (Soft Penalty)")
+    print(f"  9. Missed April Div Matchups   : {len(missed_apr_list)} / 60 pairs {missed_apr_list[:8]}")
+    print(f" 10. Missed Sept Div Matchups    : {len(missed_sep_list)} / 60 pairs {missed_sep_list[:8]}")
+    print(f" 11. ASG Core Games (Mon-Wed)    : {asg_core_games} games")
+    print(f" 12. ASG Thursday Games          : {asg_thu_games} games (Soft Penalty)")
+    print("-" * 76)
+    print("OBJECTIVE FUNCTION SCORE & COMPONENTS:")
+    print(f"  + Early/Late Divisional Series : {early_late_div_series:4d}  (x +100 = {100 * early_late_div_series:+8d})")
+    print(f"  - Isolated 1-Series Homestands : {isolated_homestands:4d}  (x -250 = {-250 * isolated_homestands:+8d})")
+    print(f"  - Isolated 1-Series Road Trips : {short_road_trips:4d}  (x -300 = {-300 * short_road_trips:+8d})")
+    print(f"  - Road Trip Initiations        : {road_trip_starts:4d}  (x  -50 = {-50 * road_trip_starts:+8d})")
+    print(f"  - Missed April Div Pairs       : {len(missed_apr_list):4d}  (x -500 = {-500 * len(missed_apr_list):+8d})")
+    print(f"  - Missed Sept Div Pairs        : {len(missed_sep_list):4d}  (x -500 = {-500 * len(missed_sep_list):+8d})")
+    print(f"  - ASG Thursday Games           : {asg_thu_games:4d}  (x -150 = {-150 * asg_thu_games:+8d})")
+    print(f"  ==========================================================================")
+    print(f"  TOTAL CP-SAT OBJECTIVE SCORE   : {objective_score:,}")
+    print("-" * 76)
+    print(f"Total League Travel Distance     : {total_miles:,} miles")
+    print("Top 3 Teams by Travel Distance   : " + ", ".join(f"{k} ({v:,} mi)" for k, v in sorted_miles[:3]))
+    print("Bottom 3 Teams by Travel Distance: " + ", ".join(f"{k} ({v:,} mi)" for k, v in sorted_miles[-3:]))
+    print("=" * 76)
 
 
 # ==============================================================================
 # MAIN EXECUTION
 # ==============================================================================
 
-def main(season_year: int = 2027, timeout_sec: int = 300, num_workers: int = 12) -> None:
+def main(
+    season_year: int = 2027,
+    timeout_sec: int = 1200,
+    num_workers: int = 12,
+    evaluate_2026: bool = False,
+    evaluate_csv: Optional[str] = None,
+) -> None:
     overall_start = time.time()
 
     teams = fetch_mlb_teams()
     dist_matrix = build_distance_matrix(teams)
 
-    slots, holidays = build_season_slots(season_year=season_year)
+    # Mode A: Audit 2026 Official Schedule from MLB API or an existing CSV file
+    if evaluate_2026:
+        df_hist = fetch_historical_mlb_schedule(2026, teams)
+        evaluate_existing_schedule(df_hist, teams, dist_matrix, season_year=2026)
+        return
 
+    if evaluate_csv:
+        print(f"\nLoading schedule from CSV '{evaluate_csv}' for evaluation...")
+        df_csv = pd.read_csv(evaluate_csv)
+        evaluate_existing_schedule(df_csv, teams, dist_matrix, season_year=season_year)
+        return
+
+    # Mode B: Full Two-Phase CP-SAT Schedule Optimization
+    slots, holidays = build_season_slots(season_year=season_year)
     series_list = solve_matchup_quotas(teams, num_workers=num_workers)
 
     assignment, metrics = solve_schedule_slots(
@@ -915,7 +1369,9 @@ def main(season_year: int = 2027, timeout_sec: int = 300, num_workers: int = 12)
     print(f"Early/Late Divisional Series: {metrics['early_late_div_series']} series")
     print(f"Missed April Div Pairs      : {metrics['missed_april_pairs']} / 60 ({metrics['missed_april_list']})")
     print(f"Missed Sept Div Pairs       : {metrics['missed_sept_pairs']} / 60 ({metrics['missed_sept_list']})")
+    print(f"ASG Thursday Early Games    : {metrics['asg_thursday_games']} games")
     print(f"Isolated 1-Series Homestands: {metrics['isolated_homestands']} league-wide")
+    print(f"Isolated 1-Series Road Trips: {metrics['isolated_road_trips']} league-wide")
     print(f"Total League Travel Distance: {total_league_miles:,} miles")
     print("\nTop 3 Teams by Travel Distance:")
     for abbr, miles in sorted_miles[:3]:
@@ -928,4 +1384,18 @@ def main(season_year: int = 2027, timeout_sec: int = 300, num_workers: int = 12)
 
 
 if __name__ == "__main__":
-    main(season_year=2027, timeout_sec=600, num_workers=12)
+    parser = argparse.ArgumentParser(description="MLB CP-SAT Schedule Optimizer & Evaluator")
+    parser.add_argument("--season-year", type=int, default=2027, help="Target season year (default: 2027)")
+    parser.add_argument("--timeout", type=int, default=1200, help="Phase 2 solver timeout in seconds (default: 1200)")
+    parser.add_argument("--workers", type=int, default=12, help="Number of CP-SAT search workers (default: 12)")
+    parser.add_argument("--evaluate-2026", action="store_true", help="Fetch and audit the official 2026 MLB schedule")
+    parser.add_argument("--evaluate-csv", type=str, default=None, help="Audit an existing schedule CSV file")
+    args = parser.parse_args()
+
+    main(
+        season_year=args.season_year,
+        timeout_sec=args.timeout,
+        num_workers=args.workers,
+        evaluate_2026=args.evaluate_2026,
+        evaluate_csv=args.evaluate_csv,
+    )
