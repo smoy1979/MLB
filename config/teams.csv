@@ -1,0 +1,31 @@
+location,team,lat,lon,league,division
+Atlanta,Braves,,,NL,East
+New York,Mets,,,NL,East
+Washington,Nationals,,,NL,East
+Florida,Marlins,,,NL,East
+Philadelphia,Phillies,,,NL,East
+Milwaukee,Brewers,,,NL,Central
+Chicago,Cubs,,,NL,Central
+Cincinnati,Reds,,,NL,Central
+Pittsburgh,Pirates,,,NL,Central
+St. Louis,Cardinals,,,NL,Central
+Arizona,Diamondbacks,,,NL,West
+Colorado,Rockies,,,NL,West
+San Diego,Padres,,,NL,West
+San Francisco,Giants,,,NL,West
+Los Angeles,Dodgers,,,NL,West
+New York,Yankees,,,AL,East
+Boston,Red Sox,,,AL,East
+Toronto,Blue Jays,,,AL,East
+Tampa Bay,Rays,,,AL,East
+Baltimore,Orioles,,,AL,East
+Detroit,Tigers,,,AL,Central
+Cleveland,Indians,,,AL,Central
+Kansas City,Royals,,,AL,Central
+Minnesota,Twins,,,AL,Central
+Chicago,White Sox,,,AL,Central
+Houston,Astros,,,AL,West
+Seattle,Mariners,,,AL,West
+Texas,Rangers,,,AL,West
+Los Angeles,Angels,,,AL,West
+Sacremento,Athletics,,,AL,West
