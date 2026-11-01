@@ -2,13 +2,15 @@ C:\Users\smoy1\AppData\Local\Programs\Python\Python311\python.exe -m venv resear
 research311\Scripts\activate
 
 pip install -r requirements.txt
-
+c:\projects\MLB\research311\Scripts\python.exe -m pip install -r requirements.txt
 
 
 
 c:; cd 'c:\projects\MLB'; & 'c:\projects\MLB\research311\Scripts\python.exe' 'c:\Users\smoy1\.vscode\extensions\ms-python.debugpy-2026.6.0-win32-x64\bundled\libs\debugpy\launcher' '60701' '--' 'C:\projects\MLB\mlb_scheduler.py'
 
 c:; cd 'c:\projects\MLB'; & 'c:\projects\MLB\research311\Scripts\python.exe' 'C:\projects\MLB\mlb_scheduler.py' '--evaluate-2026'
+
+c:; cd 'c:\projects\MLB'; & 'c:\projects\MLB\research311\Scripts\python.exe' 'C:\projects\MLB\mlb_scheduler.py' '--evaluate-csv data/mlb_schedule.csv'
 
 
 Loaded 2,430 official regular season games for 2026.

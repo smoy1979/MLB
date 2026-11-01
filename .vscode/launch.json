@@ -26,7 +26,10 @@
                 "PYDEVD_WARN_EVALUATION_TIMEOUT": "300000",
                 "PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "3",
                 "PYTHONPATH": "${workspaceFolder}",
-            }
+            },
+            "args": [
+                "--evaluate-csv=data/mlb_schedule.csv"
+            ]
         }
     ]
 }
