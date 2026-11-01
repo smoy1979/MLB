@@ -75,11 +75,38 @@ FALLBACK_TEAMS: List[Dict[str, Any]] = [
     {"id": 137, "name": "San Francisco Giants", "abbr": "SF", "league": "NL", "division": "NL West", "venue": "Oracle Park", "lat": 37.7786, "lon": -122.3893},
 ]
 
+# Venue UTC-relative time zone offsets for regular season (EDT=0, CDT=-1, MDT/MST=-2, PDT=-3)
+TEAM_TIMEZONES: Dict[str, int] = {
+    # Eastern (0)
+    "BAL": 0, "BOS": 0, "NYY": 0, "TB": 0, "TOR": 0,
+    "CLE": 0, "DET": 0, "ATL": 0, "MIA": 0, "NYM": 0,
+    "PHI": 0, "WSH": 0, "CIN": 0, "PIT": 0,
+    # Central (-1)
+    "CWS": -1, "KC": -1, "MIN": -1, "HOU": -1, "TEX": -1,
+    "CHC": -1, "MIL": -1, "STL": -1,
+    # Mountain / Arizona (-2)
+    "COL": -2, "AZ": -2,
+    # Pacific (-3)
+    "LAA": -3, "ATH": -3, "SEA": -3, "LAD": -3, "SD": -3, "SF": -3,
+}
+
 NATURAL_RIVALS: List[Tuple[str, str]] = [
     ("BAL", "WSH"), ("BOS", "ATL"), ("NYY", "NYM"), ("TB", "MIA"), ("TOR", "PHI"),
     ("CWS", "CHC"), ("CLE", "CIN"), ("DET", "PIT"), ("KC", "STL"), ("MIN", "MIL"),
     ("HOU", "COL"), ("LAA", "LAD"), ("ATH", "SF"), ("SEA", "SD"), ("TEX", "AZ")
 ]
+
+
+def build_timezone_matrix(teams: List[Dict[str, Any]]) -> List[List[int]]:
+    """Returns a 30x30 matrix where entry (i, j) is the absolute hour difference between venues."""
+    n = len(teams)
+    tz_diff = [[0] * n for _ in range(n)]
+    for i in range(n):
+        tz_i = TEAM_TIMEZONES.get(teams[i]["abbr"], 0)
+        for j in range(n):
+            tz_j = TEAM_TIMEZONES.get(teams[j]["abbr"], 0)
+            tz_diff[i][j] = abs(tz_i - tz_j)
+    return tz_diff
 
 
 def fetch_mlb_teams() -> List[Dict[str, Any]]:
@@ -559,7 +586,8 @@ def solve_schedule_slots(
     """
     Phase 2 CP-SAT Model:
     Assigns all 780 series to the 52 active half-week slots.
-    Enforces <= 16 consecutive playing days (hard: < 17 days) and penalizes > 9 days (soft).
+    Enforces <= 16 consecutive playing days (hard), <= 3 consecutive weeks with Monday
+    or Thursday off-days (hard), and soft penalties for playing streaks > 9 days.
     """
     print("\nPhase 2: Building CP-SAT slot assignment and road-trip routing model...")
     t0 = time.time()
@@ -663,6 +691,53 @@ def solve_schedule_slots(
                     model.Add(is_4g[t, s_a] + is_4g[t, s_b] <= 1)
 
     # --------------------------------------------------------------------------
+    # CONSECUTIVE WEEKS WITH MONDAY / THURSDAY OFF-DAYS (<= 3 in a row)
+    # --------------------------------------------------------------------------
+    # Collect standard regular weeks (excluding Opening weekend and ASG break)
+    weeks_meta = []
+    curr_s = 1
+    while curr_s < len(slots) - 1:
+        s_a = curr_s
+        s_b = curr_s + 1
+        if not slots[s_a]["is_asg"] and not slots[s_b]["is_asg"]:
+            weeks_meta.append((s_a, s_b))
+        curr_s += 2
+
+    for t in range(n_teams):
+        mon_off_vars = []
+        thu_off_vars = []
+
+        for w_idx, (s_a, s_b) in enumerate(weeks_meta):
+            prev_s_b = weeks_meta[w_idx - 1][1] if w_idx > 0 else 0
+            prev_wrap = slots[prev_s_b].get("is_monday_holiday_wrap", False)
+
+            # Monday off-day indicator: 1 if off, 0 if playing
+            if prev_wrap or slots[s_a].get("holiday") == "July 4th":
+                # Monday is guaranteed occupied by holiday play
+                mon_off = model.NewConstant(0)
+            else:
+                # Monday is off if the team does NOT play 4 games in Slot A
+                mon_off = model.NewBoolVar(f"mon_off_{t}_{w_idx}")
+                model.Add(mon_off == 1 - is_4g[t, s_a])
+            mon_off_vars.append(mon_off)
+
+            # Thursday off-day indicator: 1 if off, 0 if playing
+            if slots[s_b].get("shares_thu_with_prev", False):
+                # Weekend starts Thursday if team plays 4 games in Slot B
+                thu_off = model.NewBoolVar(f"thu_off_{t}_{w_idx}")
+                model.Add(thu_off == 1 - is_4g[t, s_b])
+            else:
+                # Slot B doesn't share Thursday (e.g. Memorial/Labor wrap or force_3g)
+                # Thursday was played in Slot A
+                thu_off = model.NewConstant(0)
+            thu_off_vars.append(thu_off)
+
+        # Hard constraints: no more than 3 consecutive weeks with Monday or Thursday off
+        for i in range(len(mon_off_vars) - 3):
+            model.Add(sum(mon_off_vars[i:i + 4]) <= 3)
+            model.Add(sum(thu_off_vars[i:i + 4]) <= 3)
+
+    # --------------------------------------------------------------------------
     # CONSECUTIVE PLAYING DAYS: Hard < 17 Days (<= 16 days), Soft Penalty > 9 Days
     # --------------------------------------------------------------------------
     season_start_date = slots[0]["dates_4g"][0]
@@ -688,12 +763,10 @@ def solve_schedule_slots(
             for d in only_4g_dates:
                 play_day[d] = play_day[d] + is_4g[t, s]
 
-        # Hard constraint: strictly < 17 consecutive days (no 17-day window with 17 games)
         for d_idx in range(total_cal_days - 16):
             win_17 = [play_day[cal_dates[d_idx + k]] for k in range(17)]
             model.Add(sum(win_17) <= 16)
 
-        # Soft penalty for any streak > 9 consecutive days
         for d_idx in range(total_cal_days - 9):
             win_10 = [play_day[cal_dates[d_idx + k]] for k in range(10)]
             if any(isinstance(v, int) and v == 0 for v in win_10):
@@ -1437,6 +1510,70 @@ def compute_team_playing_streaks(
     return max_streak, streaks_ge_17, streaks_10_to_16, excess_days_over_9
 
 
+def compute_timezone_shifts_ge_2h(df: pd.DataFrame, teams: List[Dict[str, Any]]) -> int:
+    """Counts the total occurrences of teams traveling across >= 2 timezone boundaries between consecutive series."""
+    df_temp = df.copy()
+    df_temp["DateObj"] = pd.to_datetime(df_temp["Date"]).dt.date
+    tz_map = {t["abbr"]: TEAM_TIMEZONES.get(t["abbr"], 0) for t in teams}
+    total_shifts_ge_2h = 0
+
+    for t in teams:
+        ab = t["abbr"]
+        t_games = df_temp[(df_temp["HomeTeam"] == ab) | (df_temp["AwayTeam"] == ab)].sort_values("DateObj")
+        # Identify consecutive series venues
+        series_venues = []
+        last_slot = None
+        for _, row in t_games.iterrows():
+            slot = row.get("SeriesSlot")
+            if slot != last_slot:
+                series_venues.append(row["HomeTeam"])
+                last_slot = slot
+
+        for k in range(1, len(series_venues)):
+            v_prev = series_venues[k - 1]
+            v_curr = series_venues[k]
+            if abs(tz_map[v_prev] - tz_map[v_curr]) >= 2:
+                total_shifts_ge_2h += 1
+
+    return total_shifts_ge_2h
+
+
+def compute_consecutive_dow_offdays(df: pd.DataFrame, teams: List[Dict[str, Any]], dow_target: str) -> List[Tuple[str, int]]:
+    """Checks for teams with > 3 consecutive weeks where `dow_target` (e.g. 'Monday', 'Thursday') is an off-day."""
+    df_temp = df.copy()
+    df_temp["DateObj"] = pd.to_datetime(df_temp["Date"]).dt.date
+    violations = []
+
+    for t in teams:
+        ab = t["abbr"]
+        t_games = df_temp[(df_temp["HomeTeam"] == ab) | (df_temp["AwayTeam"] == ab)]
+        play_dates = set(t_games["DateObj"].tolist())
+
+        # Group by full calendar weeks (Monday through Sunday)
+        min_date = min(df_temp["DateObj"])
+        start_mon = min_date - datetime.timedelta(days=min_date.weekday())
+        max_date = max(df_temp["DateObj"])
+        curr_mon = start_mon
+
+        consec_off = 0
+        max_consec = 0
+
+        while curr_mon <= max_date:
+            target_date = curr_mon if dow_target == "Monday" else curr_mon + datetime.timedelta(days=3)
+            if target_date not in play_dates:
+                consec_off += 1
+                if consec_off > max_consec:
+                    max_consec = consec_off
+            else:
+                consec_off = 0
+            curr_mon += datetime.timedelta(days=7)
+
+        if max_consec > 3:
+            violations.append((ab, max_consec))
+
+    return violations
+
+
 def run_validation_checks(
     df: pd.DataFrame,
     teams: List[Dict[str, Any]],
@@ -1453,7 +1590,7 @@ def run_validation_checks(
     assert len(df) == 2430, f"Expected 2,430 total games, got {len(df)}"
     print("[PASS] Total regular season games == 2,430 (780 total series)")
 
-    # 1. Verify No Doubleheaders (No team plays more than 1 game on any calendar date)
+    # 1. Verify No Doubleheaders
     team_dates = pd.concat([
         df[["Date", "HomeTeam"]].rename(columns={"HomeTeam": "Team"}),
         df[["Date", "AwayTeam"]].rename(columns={"AwayTeam": "Team"}),
@@ -1462,7 +1599,7 @@ def run_validation_checks(
     assert len(dups) == 0, f"Found {len(dups) // 2} doubleheaders! Sample:\n{dups.head(6)}"
     print("[PASS] Zero doubleheaders scheduled (no team plays twice on the same date)")
 
-    # 2. Verify Contiguous Series Dates (excluding Opening Weekend's traditional Friday buffer off-day)
+    # 2. Verify Contiguous Series Dates
     df_temp = df.copy()
     df_temp["DateObj"] = pd.to_datetime(df_temp["Date"]).dt.date
     non_contiguous = []
@@ -1476,7 +1613,7 @@ def run_validation_checks(
     assert len(non_contiguous) == 0, f"Found {len(non_contiguous)} non-contiguous series: {non_contiguous[:5]}"
     print("[PASS] All regular series after Opening Weekend have strictly contiguous calendar dates")
 
-    # 3. Verify Inter-Series Off-Day Gaps (Hard: <= 2 off-days outside ASG; Soft metric: count of 2-day gaps)
+    # 3. Verify Inter-Series Off-Day Gaps
     asg_mon = holidays["asg_monday"]
     asg_fri = asg_mon + datetime.timedelta(days=4)
     two_day_gaps = []
@@ -1504,7 +1641,7 @@ def run_validation_checks(
         f"(2-off-day gaps league-wide: {len(two_day_gaps)})"
     )
 
-    # 3b. Verify Consecutive Playing Days (Hard: < 17 consecutive days; Soft: > 9 consecutive days)
+    # 3b. Verify Consecutive Playing Days
     max_streak, streaks_ge_17, streaks_10_to_16, excess_days_over_9 = compute_team_playing_streaks(df, teams)
     assert len(streaks_ge_17) == 0, f"Found playing streaks >= 17 consecutive days: {streaks_ge_17[:5]}"
     print(
@@ -1512,7 +1649,18 @@ def run_validation_checks(
         f"(Max streak: {max_streak}d | Streaks 10-16d: {len(streaks_10_to_16)} | Excess days >9: {excess_days_over_9})"
     )
 
-    # 4. Verify Divisional Spacing Rules (<= 2 series in any 31-day span, and <= 95 days between consecutive series)
+    # 3c. Verify Monday & Thursday Off-Day Spacing (Hard: <= 3 consecutive weeks)
+    mon_viols = compute_consecutive_dow_offdays(df, teams, "Monday")
+    thu_viols = compute_consecutive_dow_offdays(df, teams, "Thursday")
+    assert len(mon_viols) == 0, f"Teams with >3 consecutive weeks of Monday off-days: {mon_viols}"
+    assert len(thu_viols) == 0, f"Teams with >3 consecutive weeks of Thursday off-days: {thu_viols}"
+    print("[PASS] No team has >3 consecutive weeks using Monday or Thursday as an off-day")
+
+    # 3d. Check Timezone Shifts (>= 2 hours)
+    tz_shifts = compute_timezone_shifts_ge_2h(df, teams)
+    print(f"[INFO] League-wide timezone shifts (>= 2 hours): {tz_shifts}")
+
+    # 4. Verify Divisional Spacing Rules
     abbr_to_div = {t["abbr"]: t["division"] for t in teams}
     div_pair_series_dates: Dict[Tuple[str, str], List[Tuple[datetime.date, datetime.date]]] = {}
     for (slot_lbl, h, a), grp in df_temp.groupby(["SeriesSlot", "HomeTeam", "AwayTeam"]):
@@ -1555,7 +1703,7 @@ def run_validation_checks(
         )
     print("[PASS] All 30 teams play on Memorial Day, July 4th, and Labor Day")
 
-    # 7. All-Star Break Check: Hard check on Mon-Wed, Soft info check on Thu
+    # 7. All-Star Break Check
     asg_wed = asg_mon + datetime.timedelta(days=2)
     asg_thu = asg_mon + datetime.timedelta(days=3)
     core_asg_games = df[(df["Date"] >= asg_mon.isoformat()) & (df["Date"] <= asg_wed.isoformat())]
@@ -1566,7 +1714,7 @@ def run_validation_checks(
         f"(Thursday {asg_thu.isoformat()} early restart games: {len(thu_asg_games)})"
     )
 
-    # 8. Verify Matchup Quotas (52 In-Div, 62 Interdiv Same-League, 48 Interleague)
+    # 8. Verify Matchup Quotas
     abbr_to_lg = {t["abbr"]: t["league"] for t in teams}
     rival_map = {}
     for a, b in NATURAL_RIVALS:
@@ -1653,7 +1801,6 @@ def run_validation_checks(
             else:
                 assert 1 <= r_len <= 3, f"Team {abbr} has homestand of {r_len} series (max 3)"
     print(f"[PASS] All road trips and homestands are <= 3 series (soft 1-series road trips: {one_series_rt_count})")
-
 
 # ==============================================================================
 # 6. HISTORICAL / 2026 SCHEDULE AUDIT & OBJECTIVE SCORE EVALUATOR
@@ -1891,6 +2038,10 @@ def evaluate_existing_schedule(
     asg_core_games = len(df[(df["DateObj"] >= asg_mon) & (df["DateObj"] <= asg_wed)])
     asg_thu_games = len(df[df["DateObj"] == asg_thu])
 
+    tz_shifts_ge_2h = compute_timezone_shifts_ge_2h(df, teams)
+    mon_viols = compute_consecutive_dow_offdays(df, teams, "Monday")
+    thu_viols = compute_consecutive_dow_offdays(df, teams, "Thursday")
+
     objective_score = (
         100 * early_late_div_series
         - 250 * isolated_homestands
@@ -1900,6 +2051,7 @@ def evaluate_existing_schedule(
         - 500 * len(missed_sep_list)
         - 150 * asg_thu_games
         - 150 * excess_days_over_9
+        - 75 * tz_shifts_ge_2h
         - 100 * gaps_eq_2_days
     )
 
@@ -1918,16 +2070,19 @@ def evaluate_existing_schedule(
     print(f"  6. Inter-Series Gap == 2 Days  : {gaps_eq_2_days} occurrences (Soft Penalty)")
     print(f"  7. Playing Streaks >= 17 Days  : {len(streaks_ge_17)} occurrences (Hard Constraint, Max={max_streak}d) {streaks_ge_17[:4]}")
     print(f"  8. Playing Streaks 10-16 Days  : {len(streaks_10_to_16)} streaks / {excess_days_over_9} excess days >9 (Soft Penalty)")
-    print(f"  9. Div Pairs >2 Series in 31d  : {len(div_31d_violations)} pairs {div_31d_violations}")
-    print(f" 10. Div Pairs >3 Months Apart   : {len(div_3m_violations)} pairs {div_3m_violations}")
-    print(f" 11. Long Road Trips (>3 series) : {long_road_trips} occurrences (Hard Constraint)")
-    print(f" 12. Long Homestands (>3 series) : {long_homestands} occurrences (Hard Constraint)")
-    print(f" 13. 1-Series Road Trips (==1)   : {short_road_trips} occurrences (Soft Penalty)")
-    print(f" 14. 1-Series Homestands (==1)   : {isolated_homestands} occurrences (Soft Penalty)")
-    print(f" 15. Missed April Div Matchups   : {len(missed_apr_list)} / 60 pairs {missed_apr_list}")
-    print(f" 16. Missed Sept Div Matchups    : {len(missed_sep_list)} / 60 pairs {missed_sep_list}")
-    print(f" 17. ASG Core Games (Mon-Wed)    : {asg_core_games} games")
-    print(f" 18. ASG Thursday Games          : {asg_thu_games} games (Soft Penalty)")
+    print(f"  9. Monday Off-Days > 3 wks in a row : {len(mon_viols)} teams {mon_viols}")
+    print(f" 10. Thursday Off-Days > 3 wks in a row: {len(thu_viols)} teams {thu_viols}")
+    print(f" 11. Timezone Shifts >= 2 Hours: {tz_shifts_ge_2h} occurrences (Soft Penalty)")
+    print(f" 12. Div Pairs >2 Series in 31d  : {len(div_31d_violations)} pairs {div_31d_violations}")
+    print(f" 13. Div Pairs >3 Months Apart   : {len(div_3m_violations)} pairs {div_3m_violations}")
+    print(f" 14. Long Road Trips (>3 series) : {long_road_trips} occurrences (Hard Constraint)")
+    print(f" 15. Long Homestands (>3 series) : {long_homestands} occurrences (Hard Constraint)")
+    print(f" 16. 1-Series Road Trips (==1)   : {short_road_trips} occurrences (Soft Penalty)")
+    print(f" 17. 1-Series Homestands (==1)   : {isolated_homestands} occurrences (Soft Penalty)")
+    print(f" 18. Missed April Div Matchups   : {len(missed_apr_list)} / 60 pairs {missed_apr_list}")
+    print(f" 19. Missed Sept Div Matchups    : {len(missed_sep_list)} / 60 pairs {missed_sep_list}")
+    print(f" 20. ASG Core Games (Mon-Wed)    : {asg_core_games} games")
+    print(f" 21. ASG Thursday Games          : {asg_thu_games} games (Soft Penalty)")
     print("-" * 76)
     print("OBJECTIVE FUNCTION SCORE & COMPONENTS:")
     print(f"  + Early/Late Divisional Series : {early_late_div_series:4d}  (x +100 = {100 * early_late_div_series:+8d})")
