@@ -8,10 +8,10 @@ Usage:
      python mlb_scheduler_9.py
 
   2. Evaluate official 2026 MLB schedule from MLB Stats API (no optimization):
-     python mlb_scheduler_9.py --evaluate-2026
+     python mlb_scheduler_9.py --evaluate-year=2026
 
   3. Evaluate any existing schedule CSV file (and generate 1-page PDFs from it):
-     python mlb_scheduler_9.py --evaluate-csv data/mlb_schedule.csv --season-year 2027
+     python mlb_scheduler_9.py --evaluate-csv=data/mlb_schedule.csv --season-year=2027
 """
 
 import argparse
@@ -1022,7 +1022,7 @@ def generate_team_schedule_pdfs(
     enable_logos: bool = True,
 ) -> None:
     """
-    Generates 30 individual ONE-PAGE Portrait PDF calendars (`data/mlb_schedule_<ABBR>.pdf`):
+    Generates 30 individual ONE-PAGE Portrait PDF calendars (`data/mlb_schedule_<ABBR>_<YEAR>.pdf`):
       - 1 single page per team (Letter Portrait: 612 x 792 pt).
       - 2 columns x 3 rows grid of month blocks (left-to-right, then top-to-bottom):
           Row 0: March / April (combined) | May
@@ -1057,7 +1057,7 @@ def generate_team_schedule_pdfs(
     for t in teams:
         abbr = t["abbr"]
         team_name = t["name"]
-        pdf_path = os.path.join(output_dir, f"mlb_schedule_{abbr}.pdf")
+        pdf_path = os.path.join(output_dir, f"mlb_schedule_{abbr}_{season_year}.pdf")
 
         t_df = df[(df["HomeTeam"] == abbr) | (df["AwayTeam"] == abbr)].copy()
         t_df["DateObj"] = pd.to_datetime(t_df["Date"]).dt.date
@@ -1188,7 +1188,7 @@ def generate_team_schedule_pdfs(
                         if g_info["is_home"]:
                             # Extra thick navy blue border for HOME games
                             c.setStrokeColor(navy)
-                            c.setLineWidth(2.2)
+                            c.setLineWidth(4.2)
                         else:
                             # Thin border for ROAD games
                             c.setStrokeColor(border_gray)
@@ -1277,7 +1277,7 @@ def generate_team_schedule_pdfs(
         c.showPage()
         c.save()
 
-    print(f"Generated 30 1-page team schedule PDFs in '{output_dir}/mlb_schedule_<TEAM>.pdf'.")
+    print(f"Generated 30 1-page team schedule PDFs in '{output_dir}/mlb_schedule_<TEAM>_<SEASON>.pdf'.")
 
 
 def run_validation_checks(
@@ -1785,7 +1785,7 @@ def main(
     season_year: int = 2027,
     timeout_sec: int = 1800,
     num_workers: int = 12,
-    evaluate_2026: bool = False,
+    evaluate_year: int = 0,
     evaluate_csv: Optional[str] = None,
     output_dir: str = "data",
     enable_logos: bool = True,
@@ -1796,9 +1796,10 @@ def main(
     dist_matrix = build_distance_matrix(teams)
 
     # Mode A: Audit 2026 Official Schedule from MLB API or an existing CSV file
-    if evaluate_2026:
-        df_hist = fetch_historical_mlb_schedule(2026, teams)
-        evaluate_existing_schedule(df_hist, teams, dist_matrix, season_year=2026)
+    if evaluate_year:
+        df_hist = fetch_historical_mlb_schedule(evaluate_year, teams)
+        evaluate_existing_schedule(df_hist, teams, dist_matrix, season_year=evaluate_year)
+        generate_team_schedule_pdfs(df_hist, teams, season_year=evaluate_year, output_dir=output_dir, enable_logos=enable_logos)
         return
 
     if evaluate_csv:
@@ -1871,7 +1872,7 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=12, help="Number of CP-SAT search workers (default: 12)")
     parser.add_argument("--output-dir", type=str, default="data", help="Output directory for CSV/PDF files (default: data)")
     parser.add_argument("--no-logos", action="store_true", help="Disable downloading team logos and use Opponent text in PDFs")
-    parser.add_argument("--evaluate-2026", action="store_true", help="Fetch and audit the official 2026 MLB schedule")
+    parser.add_argument("--evaluate-year", type=int, default=0, help="Fetch and audit the official MLB schedule from the specified year")
     parser.add_argument("--evaluate-csv", type=str, default=None, help="Audit an existing schedule CSV file and generate PDFs")
     args = parser.parse_args()
 
@@ -1879,7 +1880,7 @@ if __name__ == "__main__":
         season_year=args.season_year,
         timeout_sec=args.timeout,
         num_workers=args.workers,
-        evaluate_2026=args.evaluate_2026,
+        evaluate_year=args.evaluate_year,
         evaluate_csv=args.evaluate_csv,
         output_dir=args.output_dir,
         enable_logos=not args.no_logos,
