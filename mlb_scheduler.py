@@ -558,8 +558,8 @@ def solve_schedule_slots(
 ) -> Tuple[Dict[int, int], Dict[str, Any]]:
     """
     Phase 2 CP-SAT Model:
-    Assigns all 780 series to the 52 active half-week slots, enforcing <= 14 consecutive
-    days played (hard) and penalizing > 9 consecutive days played (soft).
+    Assigns all 780 series to the 52 active half-week slots.
+    Enforces <= 16 consecutive playing days (hard: < 17 days) and penalizes > 9 days (soft).
     """
     print("\nPhase 2: Building CP-SAT slot assignment and road-trip routing model...")
     t0 = time.time()
@@ -663,87 +663,39 @@ def solve_schedule_slots(
                     model.Add(is_4g[t, s_a] + is_4g[t, s_b] <= 1)
 
     # --------------------------------------------------------------------------
-    # CONSECUTIVE PLAYING DAYS: Hard <= 14 Days, Soft Penalty for > 9 Days
+    # CONSECUTIVE PLAYING DAYS: Hard < 17 Days (<= 16 days), Soft Penalty > 9 Days
     # --------------------------------------------------------------------------
-    # Track whether each team plays on each calendar date from Opening Day to Finale.
-    # For any midweek Slot A where a 3g series could shift from [Tue,Wed,Thu] to [Mon,Tue,Wed]
-    # because the opponent has a 4g series in Slot B:
-    #   - If shifted: Mon=1, Tue=1, Wed=1, Thu=0 (Thursday is an off-day).
-    #   - If unshifted: Mon=0, Tue=1, Wed=1, Thu=1 (Monday is an off-day).
-    # In both cases, the 3g series has an off-day on either Monday or Thursday!
-    # However, a shift to [Mon,Tue,Wed] extends the PREVIOUS weekend's streak by 3 days (Mon-Wed)
-    # before Thursday's off-day. To guarantee even a shifted [Mon,Tue,Wed] never pushes a streak
-    # past 14 days, we also cap any streak ending on Sunday at <= 11 days whenever the following
-    # Slot A could shift, OR we explicitly model daily play indicators across the season.
     season_start_date = slots[0]["dates_4g"][0]
     season_end_date = slots[-1]["dates_4g"][-1]
     total_cal_days = (season_end_date - season_start_date).days + 1
     cal_dates = [season_start_date + datetime.timedelta(days=d) for d in range(total_cal_days)]
 
-    # Map each slot to its deterministic & conditional date occupancy
     slot_by_idx = {s["slot_idx"]: s for s in slots}
     streak_over_9_vars = []
 
     for t in range(n_teams):
-        # play_day[d] is a linear expression (0, 1, or BoolVar) for whether team t plays on date d
         play_day: Dict[datetime.date, Any] = {d: 0 for d in cal_dates}
 
         for s in active_slots:
             s_meta = slot_by_idx[s]
             d3 = set(s_meta["dates_3g"])
             d4 = set(s_meta["dates_4g"])
-            always_Dates = d3.intersection(d4)
+            always_dates = d3.intersection(d4)
             only_4g_dates = d4 - d3
 
-            for d in always_Dates:
+            for d in always_dates:
                 play_day[d] = 1
             for d in only_4g_dates:
-                # Accumulate in case a date is referenced by adjacent slots (guarded by <=1 constraint)
                 play_day[d] = play_day[d] + is_4g[t, s]
 
-        # Enforce hard constraint: in any 15 consecutive calendar days, at most 14 days played
-        for d_idx in range(total_cal_days - 14):
-            win_15 = [play_day[cal_dates[d_idx + k]] for k in range(15)]
-            model.Add(sum(win_15) <= 14)
+        # Hard constraint: strictly < 17 consecutive days (no 17-day window with 17 games)
+        for d_idx in range(total_cal_days - 16):
+            win_17 = [play_day[cal_dates[d_idx + k]] for k in range(17)]
+            model.Add(sum(win_17) <= 16)
 
-        # Also guard against the 3-game [Mon,Tue,Wed] shift edge case:
-        # If a team plays 12+ consecutive days ending on a Sunday (which requires playing Friday of
-        # the week before + all 7 days of the current week = 10 days, or Thu-Sun + 7 days = 11 days,
-        # or Tue-Sun + 7 days = 13 days), and then shifts its 3g series in the next Slot A to
-        # [Mon,Tue,Wed], it would play Mon-Wed (3 days) before getting Thursday off (13 + 3 = 16 days!).
-        # That happens if and only if in week w the team had NO off-day (played Mon-Sun = 7 days),
-        # played Tue-Sun of week w-1 (6 days, so 13 days ending Sunday), AND shifted in week w+1.
-        # Even simpler and stronger: a team cannot have TWO consecutive full weeks without an off-day,
-        # AND if a team has a full 7-day week (Mon-Sun with no off-day), neither it nor its Slot A
-        # opponent in the next week can trigger a 15-day stretch.
-        # Let's check: in a normal week (Mon-Sun), a team plays all 7 days iff play_day[Mon] + play_day[Thu] == 2.
-        # If we forbid playing all 7 days in week w AND playing Thu-Sun in week w-1 (4g in W_{w-1}_B or 3g+4g),
-        # wait: Thu-Sun (4 days) + Mon-Sun (7 days) + Mon-Wed (3 days) = 14 days!
-        # It only hits 15 days if the team played Wed-Sun in week w-1 (at least 5 days) + Mon-Sun in week w (7 days)
-        # + Mon-Wed in week w+1 (3 days) = 5 + 7 + 3 = 15 days!
-        # And playing Wed-Sun in week w-1 is ONLY possible if the team had NO off-day on Thursday of week w-1!
-        # Therefore, if a team has NO off-day on Thursday of week w-1 AND NO off-day in all of week w (Mon & Thu both played),
-        # its streak ending Sunday of week w is 6 + 7 = 13 days (if Monday w-1 was off) or 12 days (if Wed-Sun).
-        # To strictly prevent a [Mon,Tue,Wed] shift in week w+1 from turning a 12 or 13 day streak into 15 or 16 days,
-        # we simply prohibit (Thu_{w-1} played) + (Mon_w played) + (Thu_w played) == 3!
-        # Wait: if Thu_{w-1} + Mon_w + Thu_w <= 2, then a team NEVER plays Tue_{w-1} through Sun_w (13 days) straight!
-        # The maximum streak ending on any Sunday is then Fri_{w-1}..Sun_w (10 days), so even +3 days (Mon-Wed shift) is at most 13 days!
-        for k_idx in range(1, len(active_slots) - 1):
-            s_curr = active_slots[k_idx]
-            s_meta = slot_by_idx[s_curr]
-            if s_meta["slot_type"] == "A" and not s_meta["is_asg"]:
-                mon_d = s_meta["dates_4g"][0]
-                thu_d = s_meta["dates_4g"][-1]
-                prev_thu_d = mon_d - datetime.timedelta(days=4)
-                if prev_thu_d in play_day and mon_d in play_day and thu_d in play_day:
-                    # Prevents Tue(w-1)..Sun(w) 13-day streak + Mon..Wed(w+1) shift = 16 days
-                    model.Add(play_day[prev_thu_d] + play_day[mon_d] + play_day[thu_d] <= 2)
-
-        # Soft penalty for any streak > 9 consecutive days:
-        # Every 10-day window where all 10 days are played adds 1 penalty unit.
+        # Soft penalty for any streak > 9 consecutive days
         for d_idx in range(total_cal_days - 9):
             win_10 = [play_day[cal_dates[d_idx + k]] for k in range(10)]
-            # Skip windows that span the All-Star Break (where 3 days are guaranteed 0)
             if any(isinstance(v, int) and v == 0 for v in win_10):
                 continue
             ov9 = model.NewBoolVar(f"strk_gt9_{t}_{d_idx}")
@@ -1124,6 +1076,7 @@ def generate_team_schedule_pdfs(
     season_year: int = 2027,
     output_dir: str = "data",
     enable_logos: bool = True,
+    subtitle: str = "",
 ) -> None:
     """
     Generates 30 individual ONE-PAGE Portrait PDF calendars (`data/mlb_schedule_<ABBR>_<YEAR>.pdf`):
@@ -1166,7 +1119,7 @@ def generate_team_schedule_pdfs(
     for t in teams:
         abbr = t["abbr"]
         team_name = t["name"]
-        pdf_path = os.path.join(output_dir, f"mlb_schedule_{abbr}_{season_year}.pdf")
+        pdf_path = os.path.join(output_dir, f"mlb_schedule_{abbr}_{season_year}_{subtitle}.pdf")
 
         t_df = df[(df["HomeTeam"] == abbr) | (df["AwayTeam"] == abbr)].copy()
         t_df["DateObj"] = pd.to_datetime(t_df["Date"]).dt.date
@@ -1208,7 +1161,7 @@ def generate_team_schedule_pdfs(
         c.rect(20, page_h - 44, page_w - 40, 32, fill=1, stroke=0)
         c.setFillColor(colors.white)
         c.setFont("Helvetica-Bold", 13)
-        c.drawString(30, page_h - 33, f"{team_name.upper()} ({abbr}) — {season_year} SCHEDULE")
+        c.drawString(30, page_h - 33, f"{team_name.upper()} ({abbr}) — {season_year} SCHEDULE - {subtitle}")
         c.setFont("Helvetica-Bold", 10)
         c.drawRightString(page_w - 30, page_h - 33, "REGULAR SEASON CALENDAR")
 
@@ -1431,16 +1384,16 @@ def compute_team_playing_streaks(
     Computes consecutive playing day streaks for all 30 teams from a daily schedule DataFrame.
     Returns:
       - max_streak: longest streak of consecutive days played by any team
-      - streaks_gt_14: list of (team, start_date, end_date, length) for streaks > 14 days
-      - streaks_10_to_14: list of (team, start_date, end_date, length) for streaks of 10..14 days
+      - streaks_ge_17: list of (team, start_date, end_date, length) for streaks >= 17 days
+      - streaks_10_to_16: list of (team, start_date, end_date, length) for streaks of 10..16 days
       - excess_days_over_9: sum of (length - 9) across all streaks > 9 days
     """
     df_temp = df.copy()
     df_temp["DateObj"] = pd.to_datetime(df_temp["Date"]).dt.date
 
     max_streak = 0
-    streaks_gt_14: List[Tuple[str, str, str, int]] = []
-    streaks_10_to_14: List[Tuple[str, str, str, int]] = []
+    streaks_ge_17: List[Tuple[str, str, str, int]] = []
+    streaks_10_to_16: List[Tuple[str, str, str, int]] = []
     excess_days_over_9 = 0
 
     for t in teams:
@@ -1464,10 +1417,10 @@ def compute_team_playing_streaks(
                     max_streak = s_len
                 if s_len > 9:
                     excess_days_over_9 += (s_len - 9)
-                    if s_len > 14:
-                        streaks_gt_14.append((abbr, s_start.isoformat(), s_prev.isoformat(), s_len))
+                    if s_len >= 17:
+                        streaks_ge_17.append((abbr, s_start.isoformat(), s_prev.isoformat(), s_len))
                     else:
-                        streaks_10_to_14.append((abbr, s_start.isoformat(), s_prev.isoformat(), s_len))
+                        streaks_10_to_16.append((abbr, s_start.isoformat(), s_prev.isoformat(), s_len))
                 s_start = d
                 s_prev = d
                 s_len = 1
@@ -1476,12 +1429,12 @@ def compute_team_playing_streaks(
             max_streak = s_len
         if s_len > 9:
             excess_days_over_9 += (s_len - 9)
-            if s_len > 14:
-                streaks_gt_14.append((abbr, s_start.isoformat(), s_prev.isoformat(), s_len))
+            if s_len >= 17:
+                streaks_ge_17.append((abbr, s_start.isoformat(), s_prev.isoformat(), s_len))
             else:
-                streaks_10_to_14.append((abbr, s_start.isoformat(), s_prev.isoformat(), s_len))
+                streaks_10_to_16.append((abbr, s_start.isoformat(), s_prev.isoformat(), s_len))
 
-    return max_streak, streaks_gt_14, streaks_10_to_14, excess_days_over_9
+    return max_streak, streaks_ge_17, streaks_10_to_16, excess_days_over_9
 
 
 def run_validation_checks(
@@ -1551,12 +1504,12 @@ def run_validation_checks(
         f"(2-off-day gaps league-wide: {len(two_day_gaps)})"
     )
 
-    # 3b. Verify Consecutive Playing Days (Hard: <= 14 consecutive days; Soft: > 9 consecutive days)
-    max_streak, streaks_gt_14, streaks_10_to_14, excess_days_over_9 = compute_team_playing_streaks(df, teams)
-    assert len(streaks_gt_14) == 0, f"Found playing streaks > 14 consecutive days: {streaks_gt_14[:5]}"
+    # 3b. Verify Consecutive Playing Days (Hard: < 17 consecutive days; Soft: > 9 consecutive days)
+    max_streak, streaks_ge_17, streaks_10_to_16, excess_days_over_9 = compute_team_playing_streaks(df, teams)
+    assert len(streaks_ge_17) == 0, f"Found playing streaks >= 17 consecutive days: {streaks_ge_17[:5]}"
     print(
-        f"[PASS] All teams play <= 14 consecutive days before an off-day "
-        f"(Max streak: {max_streak}d | Streaks 10-14d: {len(streaks_10_to_14)} | Excess days >9: {excess_days_over_9})"
+        f"[PASS] All teams play < 17 consecutive days before an off-day "
+        f"(Max streak: {max_streak}d | Streaks 10-16d: {len(streaks_10_to_16)} | Excess days >9: {excess_days_over_9})"
     )
 
     # 4. Verify Divisional Spacing Rules (<= 2 series in any 31-day span, and <= 95 days between consecutive series)
@@ -1785,7 +1738,7 @@ def evaluate_existing_schedule(
     dup_rows = team_dates[team_dates.duplicated(subset=["Date", "Team"], keep=False)]
     num_doubleheaders = len(dup_rows) // 2
 
-    max_streak, streaks_gt_14, streaks_10_to_14, excess_days_over_9 = compute_team_playing_streaks(df, teams)
+    max_streak, streaks_ge_17, streaks_10_to_16, excess_days_over_9 = compute_team_playing_streaks(df, teams)
 
     df_sorted = df.sort_values(by=["DateObj", "HomeTeam", "AwayTeam"]).reset_index(drop=True)
     active_series: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -1963,8 +1916,8 @@ def evaluate_existing_schedule(
     print(f"  4. Non-Opening Series w/ Gap   : {len(internal_gap_series)} series {internal_gap_series}")
     print(f"  5. Inter-Series Gap > 2 Days   : {gaps_gt_2_days} occurrences (Hard Constraint)")
     print(f"  6. Inter-Series Gap == 2 Days  : {gaps_eq_2_days} occurrences (Soft Penalty)")
-    print(f"  7. Playing Streaks > 14 Days   : {len(streaks_gt_14)} occurrences (Hard Constraint, Max={max_streak}d) {streaks_gt_14[:4]}")
-    print(f"  8. Playing Streaks 10-14 Days  : {len(streaks_10_to_14)} streaks / {excess_days_over_9} excess days >9 (Soft Penalty)")
+    print(f"  7. Playing Streaks >= 17 Days  : {len(streaks_ge_17)} occurrences (Hard Constraint, Max={max_streak}d) {streaks_ge_17[:4]}")
+    print(f"  8. Playing Streaks 10-16 Days  : {len(streaks_10_to_16)} streaks / {excess_days_over_9} excess days >9 (Soft Penalty)")
     print(f"  9. Div Pairs >2 Series in 31d  : {len(div_31d_violations)} pairs {div_31d_violations}")
     print(f" 10. Div Pairs >3 Months Apart   : {len(div_3m_violations)} pairs {div_3m_violations}")
     print(f" 11. Long Road Trips (>3 series) : {long_road_trips} occurrences (Hard Constraint)")
@@ -2017,14 +1970,14 @@ def main(
     if evaluate_year:
         df_hist = fetch_historical_mlb_schedule(evaluate_year, teams)
         evaluate_existing_schedule(df_hist, teams, dist_matrix, season_year=evaluate_year)
-        generate_team_schedule_pdfs(df_hist, teams, season_year=evaluate_year, output_dir=output_dir, enable_logos=enable_logos)
+        generate_team_schedule_pdfs(df_hist, teams, season_year=evaluate_year, output_dir=output_dir, enable_logos=enable_logos, subtitle="official")
         return
 
     if evaluate_csv:
         print(f"\nLoading schedule from CSV '{evaluate_csv}' for evaluation...")
         df_csv = pd.read_csv(evaluate_csv)
         evaluate_existing_schedule(df_csv, teams, dist_matrix, season_year=season_year)
-        generate_team_schedule_pdfs(df_csv, teams, season_year=season_year, output_dir=output_dir, enable_logos=enable_logos)
+        generate_team_schedule_pdfs(df_csv, teams, season_year=season_year, output_dir=output_dir, enable_logos=enable_logos, subtitle="proposed")
         return
 
     # Mode B: Full Two-Phase CP-SAT Schedule Optimization
@@ -2051,7 +2004,7 @@ def main(
     )
 
     master_csv = export_schedule_files(df, teams, output_dir=output_dir)
-    generate_team_schedule_pdfs(df, teams, season_year=season_year, output_dir=output_dir, enable_logos=enable_logos)
+    generate_team_schedule_pdfs(df, teams, season_year=season_year, output_dir=output_dir, enable_logos=enable_logos, subtitle="proposed")
 
     run_validation_checks(df, teams, series_list, assignment, slots, holidays)
 

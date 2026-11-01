@@ -5,7 +5,7 @@
             "name": "mlb_scheduler.py",
             "type": "debugpy",
             "request": "launch",
-            "program": "main.py",
+            "program": "mlb_scheduler.py",
             "console": "integratedTerminal",
             "env": {
                 "PYDEVD_WARN_EVALUATION_TIMEOUT": "300000",
