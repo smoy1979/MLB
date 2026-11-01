@@ -1002,11 +1002,12 @@ def solve_schedule_slots(
             road_trip_starts.append(rt_start)
 
     # --------------------------------------------------------------------------
-    # TIME ZONE SHIFTS (>= 2 Hours)
+    # TIME ZONE SHIFTS (All 1h+ shifts & >= 2h jumps)
     # --------------------------------------------------------------------------
     venue_tz_val = [abs(TEAM_TIMEZONES.get(teams[h]["abbr"], 0)) for h in range(n_teams)]
 
     tz_shifts_ge2_vars = []
+    tz_abs_vars = []
     for t in range(n_teams):
         t_sids = home_series_by_team[t] + away_series_by_team[t]
 
@@ -1022,6 +1023,7 @@ def solve_schedule_slots(
             model.Add(tz_diff == tz_next - tz_curr)
             tz_abs = model.NewIntVar(0, 3, f"tz_abs_{t}_{k}")
             model.AddAbsEquality(tz_abs, tz_diff)
+            tz_abs_vars.append(tz_abs)
 
             tz_ge2 = model.NewBoolVar(f"tz_ge2_{t}_{k}")
             model.Add(tz_abs - 1 <= 2 * tz_ge2)
@@ -1047,22 +1049,23 @@ def solve_schedule_slots(
                     model.Add(g2 >= 1 - is_4g[t, s1] - is_4g[t, s2])
                     gaps_2d_vars.append(g2)
 
-    # Phase 2 Objective with Softened Divisional Spacing & Road Trip / Homestand Caps
+    # Phase 2 Objective: Tightened LongH/A, ASGThu, and Continuous Timezone Corridor Clustering
     model.Maximize(
         150 * sum(div_early_late_terms)
         - 250 * sum(isolated_home_vars)
         - 400 * sum(isolated_away_vars)
-        - 300 * sum(long_home_vars)
-        - 300 * sum(long_away_vars)
+        - 650 * sum(long_home_vars)
+        - 650 * sum(long_away_vars)
         - 300 * sum(div_31d_pen_vars)
         - 300 * sum(div_91d_pen_vars)
         - 50 * sum(road_trip_starts)
         - 1500 * sum(missed_april_vars)
         - 1500 * sum(missed_sept_vars)
-        - 150 * sum(asg_thursday_4g_vars)
+        - 1000 * sum(asg_thursday_4g_vars)
         - 150 * sum(streak_over_9_vars)
-        - 100 * sum(consec_dow_off_penalties)
-        - 350 * sum(tz_shifts_ge2_vars)
+        - 150 * sum(consec_dow_off_penalties)
+        - 250 * sum(tz_shifts_ge2_vars)
+        - 125 * sum(tz_abs_vars)
         - 100 * sum(gaps_2d_vars)
     )
 
@@ -1143,9 +1146,11 @@ def expand_to_daily_schedule(
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """
     Expands the solved series-to-slot assignment into 2,430 individual game records.
-    Automatically shifts a 3-game midweek Slot A series to [Mon, Tue, Wed] whenever
-    either participating team plays a 4-game weekend Slot B series starting on Thursday,
-    guaranteeing zero Thursday doubleheaders and <= 1 off-day between consecutive series.
+    1. Automatically shifts a 3-game midweek Slot A series to [Mon, Tue, Wed] whenever
+       either participating team plays a 4-game weekend Slot B series starting on Thursday.
+    2. Actively chooses [Mon, Tue, Wed] vs [Tue, Wed, Thu] for optional 3-game midweek
+       series to balance Monday vs Thursday off-days (preventing >3 consecutive weeks
+       with Monday off) while respecting playing streak limits.
     """
     n_teams = len(teams)
     active_slots = [s["slot_idx"] for s in slots if not s["is_asg"]]
@@ -1164,9 +1169,14 @@ def expand_to_daily_schedule(
     current_venue = {t: t for t in range(n_teams)}
     team_total_miles = {teams[t]["abbr"]: 0 for t in range(n_teams)}
 
+    # Track consecutive Monday off-days and current playing streak per team
+    consec_mon_off = {t: 0 for t in range(n_teams)}
+    consec_thu_off = {t: 0 for t in range(n_teams)}
+    team_play_dates: Dict[int, set] = {t: set() for t in range(n_teams)}
+
     records = []
 
-    for s in active_slots:
+    for k_idx, s in enumerate(active_slots):
         slot_meta = slots[s]
         slot_label = slot_meta["label"]
         next_s = s + 1
@@ -1174,6 +1184,10 @@ def expand_to_daily_schedule(
             next_s < len(slots)
             and not slots[next_s]["is_asg"]
             and slots[next_s].get("shares_thu_with_prev", False)
+        )
+        prev_s = active_slots[k_idx - 1] if k_idx > 0 else None
+        prev_was_mon_wrap = (
+            prev_s is not None and slots[prev_s].get("is_monday_holiday_wrap", False)
         )
 
         for sr in slot_series[s]:
@@ -1193,13 +1207,72 @@ def expand_to_daily_schedule(
             if g_cnt == 4:
                 dates = slot_meta["dates_4g"]
             else:
-                if next_shares_thu and (
+                must_shift_early = next_shares_thu and (
                     h_idx in teams_playing_4g_in_slot.get(next_s, set())
                     or a_idx in teams_playing_4g_in_slot.get(next_s, set())
-                ):
+                )
+                can_shift_early = (
+                    slot_meta["slot_type"] == "A"
+                    and not slot_meta.get("force_3g", False)
+                    and not prev_was_mon_wrap
+                    and slot_meta.get("dates_3g_early", slot_meta["dates_3g"]) != slot_meta["dates_3g"]
+                )
+
+                if must_shift_early:
                     dates = slot_meta.get("dates_3g_early", slot_meta["dates_3g"])
+                elif can_shift_early:
+                    # Check if shifting to [Mon, Tue, Wed] helps break a Monday off-day run (>= 2 weeks)
+                    # without pushing either team's consecutive playing streak past 9 days
+                    early_dates = slot_meta["dates_3g_early"]
+                    mon_d = early_dates[0]
+
+                    # Count how many consecutive days each team has played leading into Monday
+                    def prior_streak(t_id: int, ref_date: datetime.date) -> int:
+                        cnt = 0
+                        cur = ref_date - datetime.timedelta(days=1)
+                        while cur in team_play_dates[t_id]:
+                            cnt += 1
+                            cur -= datetime.timedelta(days=1)
+                        return cnt
+
+                    h_prior = prior_streak(h_idx, mon_d)
+                    a_prior = prior_streak(a_idx, mon_d)
+
+                    # Shifting to [Mon, Tue, Wed] adds 3 days to the prior weekend streak, then gives Thu off!
+                    streak_safe = (h_prior + 3 <= 9) and (a_prior + 3 <= 9)
+                    thu_safe = (consec_thu_off[h_idx] < 2) and (consec_thu_off[a_idx] < 2)
+                    needs_mon_play = (consec_mon_off[h_idx] >= 2) or (consec_mon_off[a_idx] >= 2)
+
+                    if streak_safe and thu_safe and needs_mon_play:
+                        dates = early_dates
+                    else:
+                        dates = slot_meta["dates_3g"]
                 else:
                     dates = slot_meta["dates_3g"]
+
+            # Update play dates and Monday/Thursday off-day streak counters for midweek Slot A
+            for d in dates:
+                team_play_dates[h_idx].add(d)
+                team_play_dates[a_idx].add(d)
+
+            if slot_meta["slot_type"] == "A" and not slot_meta["is_asg"] and slot_meta["dates_4g"]:
+                mon_date = slot_meta["dates_4g"][0]
+                if mon_date.weekday() == 0:
+                    for tid in (h_idx, a_idx):
+                        if mon_date in team_play_dates[tid]:
+                            consec_mon_off[tid] = 0
+                        else:
+                            consec_mon_off[tid] += 1
+
+            if slot_meta["slot_type"] == "B" and slot_meta["dates_4g"]:
+                # Check Thursday of this week
+                thu_cand = slot_meta["dates_4g"][0]
+                if thu_cand.weekday() == 3:
+                    for tid in (h_idx, a_idx):
+                        if thu_cand in team_play_dates[tid]:
+                            consec_thu_off[tid] = 0
+                        else:
+                            consec_thu_off[tid] += 1
 
             for g_num, g_date in enumerate(dates, start=1):
                 dow = g_date.strftime("%A")
@@ -2317,11 +2390,11 @@ def evaluate_existing_schedule(
             150 * m["early_late_div"]
             - 250 * m["iso_h"]
             - 400 * m["iso_a"]
-            - 300 * (m["long_h"] + m["long_a"])
+            - 650 * (m["long_h"] + m["long_a"])
             - 50 * m["rt_starts"]
-            - 150 * m["asg_thu"]
+            - 1000 * m["asg_thu"]
             - 150 * m["streak_gt9"]
-            - 100 * (m["mon_off_pen"] + m["thu_off_pen"])
+            - 150 * (m["mon_off_pen"] + m["thu_off_pen"])
             - 350 * m["tz_shifts_ge2"]
             - 100 * m["gaps_2d"]
         )
@@ -2358,16 +2431,16 @@ def evaluate_existing_schedule(
         150 * early_late_div_series
         - 250 * isolated_homestands
         - 400 * short_road_trips
-        - 300 * long_homestands
-        - 300 * long_road_trips
+        - 650 * long_homestands
+        - 650 * long_road_trips
         - 300 * len(div_31d_violations)
         - 300 * len(div_3m_violations)
         - 50 * road_trip_starts
         - 1500 * len(missed_apr_list)
         - 1500 * len(missed_sep_list)
-        - 150 * asg_thu_games
+        - 1000 * asg_thu_games
         - 150 * excess_days_over_9
-        - 100 * total_excess_dow
+        - 150 * total_excess_dow
         - 350 * tz_shifts_ge_2h
         - 100 * gaps_eq_2_days
     )
