@@ -20,6 +20,7 @@ import math
 import time
 import datetime
 from typing import Dict, List, Tuple, Any, Optional
+import itertools
 import requests
 import pandas as pd
 from ortools.sat.python import cp_model
@@ -177,6 +178,132 @@ def build_distance_matrix(teams: List[Dict[str, Any]]) -> List[List[int]]:
             dist[i][j] = d
             dist[j][i] = d
     return dist
+
+
+def optimize_away_leg_ordering(
+    teams: List[Dict[str, Any]],
+    slots: List[Dict[str, Any]],
+    series_list: List[Dict[str, Any]],
+    assignment: Dict[int, int],
+    dist_matrix: List[List[int]],
+    season_year: int = 2027,
+) -> Dict[int, int]:
+    """
+    Post-optimization TSP optimizer:
+    Identifies multi-series road trips for each team and evaluates valid slot permutations
+    of those away series to minimize sequential venue-to-venue Haversine travel distance,
+    without altering home dates, series lengths, or rest constraints.
+    """
+    n_teams = len(teams)
+    active_slots = [s["slot_idx"] for s in slots if not s["is_asg"]]
+    slot_to_series = {s: [] for s in active_slots}
+    for sid, s in assignment.items():
+        slot_to_series[s].append(sid)
+
+    def compute_total_miles(assign_map: Dict[int, int]) -> int:
+        slot_to_venue = {t: {} for t in range(n_teams)}
+        for sid, s in assign_map.items():
+            sr = series_list[sid]
+            h, a = sr["home"], sr["away"]
+            slot_to_venue[h][s] = h
+            slot_to_venue[a][s] = h
+        total = 0
+        for t in range(n_teams):
+            prev_v = t
+            for s in active_slots:
+                curr_v = slot_to_venue[t][s]
+                total += dist_matrix[prev_v][curr_v]
+                prev_v = curr_v
+            total += dist_matrix[prev_v][t]  # return home
+        return total
+
+    initial_miles = compute_total_miles(assignment)
+    print(f"\nPost-processing travel routing (Initial league travel: {initial_miles:,} miles)...")
+
+    improved_assignment = dict(assignment)
+
+    # For each team, identify consecutive road series runs (length 2 or 3)
+    team_away_slots: Dict[int, List[int]] = {t: [] for t in range(n_teams)}
+    for sid, s in improved_assignment.items():
+        a = series_list[sid]["away"]
+        team_away_slots[a].append(s)
+
+    swaps_made = 0
+    for t in range(n_teams):
+        a_slots = sorted(team_away_slots[t])
+        # Find runs of consecutive active slots where team t is away
+        runs = []
+        curr_run = []
+        for s in a_slots:
+            if not curr_run or active_slots.index(s) == active_slots.index(curr_run[-1]) + 1:
+                curr_run.append(s)
+            else:
+                if len(curr_run) in (2, 3):
+                    runs.append(list(curr_run))
+                curr_run = [s]
+        if len(curr_run) in (2, 3):
+            runs.append(list(curr_run))
+
+        for run in runs:
+            # Series played by team t in this road trip
+            run_sids = [sid for s in run for sid in slot_to_series[s] if series_list[sid]["away"] == t]
+            if len(run_sids) != len(run):
+                continue
+
+            # Prior venue (before road trip) and next venue (after road trip)
+            k_first = active_slots.index(run[0])
+            k_last = active_slots.index(run[-1])
+            prev_v = t if k_first == 0 else [
+                series_list[sid]["home"] for sid in slot_to_series[active_slots[k_first - 1]]
+                if series_list[sid]["home"] == t or series_list[sid]["away"] == t
+            ][0]
+            next_v = t if k_last == len(active_slots) - 1 else [
+                series_list[sid]["home"] for sid in slot_to_series[active_slots[k_last + 1]]
+                if series_list[sid]["home"] == t or series_list[sid]["away"] == t
+            ][0]
+
+            best_order = run_sids
+            best_cost = None
+
+            for perm in itertools.permutations(run_sids):
+                # Verify 4-game / 3-game compatibility with slots in run
+                valid = True
+                for slot_idx, cand_sid in zip(run, perm):
+                    cand_sr = series_list[cand_sid]
+                    if slots[slot_idx].get("force_3g", False) and cand_sr["games"] == 4:
+                        valid = False
+                        break
+                    # Verify opponent does not have a conflict in that slot
+                    opp = cand_sr["home"]
+                    opp_sids_in_slot = [sid for sid in slot_to_series[slot_idx] if sid != cand_sid]
+                    if any(series_list[sid]["home"] == opp or series_list[sid]["away"] == opp for sid in opp_sids_in_slot):
+                        valid = False
+                        break
+                if not valid:
+                    continue
+
+                # Compute distance for this candidate ordering: prev_v -> h1 -> h2 (-> h3) -> next_v
+                venues = [series_list[sid]["home"] for sid in perm]
+                cost = dist_matrix[prev_v][venues[0]]
+                for i in range(len(venues) - 1):
+                    cost += dist_matrix[venues[i]][venues[i + 1]]
+                cost += dist_matrix[venues[-1]][next_v]
+
+                if best_cost is None or cost < best_cost:
+                    best_cost = cost
+                    best_order = perm
+
+            if best_order != run_sids:
+                # Apply the swap
+                for slot_idx, new_sid, old_sid in zip(run, best_order, run_sids):
+                    improved_assignment[new_sid] = slot_idx
+                    slot_to_series[slot_idx].remove(old_sid)
+                    slot_to_series[slot_idx].append(new_sid)
+                swaps_made += 1
+
+    final_miles = compute_total_miles(improved_assignment)
+    print(f"Post-processing complete: Made {swaps_made} road-trip route swaps. New total travel: {final_miles:,} miles.")
+    return improved_assignment
 
 
 # ==============================================================================
@@ -959,19 +1086,19 @@ def solve_schedule_slots(
 
     # Fully Aligned Phase 2 Objective
     # Rebalanced Phase 2 Objective for Geographic & Competitive Balance
+    # Phase 2 Re-calibrated Objective: Divisional Integrity + Regional Travel Swings
     model.Maximize(
-        100 * sum(div_early_late_terms)
-        - 200 * sum(isolated_home_vars)
-        - 450 * sum(isolated_away_vars)
+        150 * sum(div_early_late_terms)
+        - 250 * sum(isolated_home_vars)
+        - 400 * sum(isolated_away_vars)
         - 50 * sum(road_trip_starts)
-        - 1000 * sum(missed_april_vars)
-        - 1000 * sum(missed_sept_vars)
+        - 1500 * sum(missed_april_vars)
+        - 1500 * sum(missed_sept_vars)
         - 150 * sum(asg_thursday_4g_vars)
         - 150 * sum(streak_over_9_vars)
         - 100 * sum(consec_dow_off_penalties)
-        - 250 * sum(tz_shifts_ge2_vars)
+        - 350 * sum(tz_shifts_ge2_vars)
         - 100 * sum(gaps_2d_vars)
-        - 1 * sum(travel_10mi_terms)
     )
 
     solver = cp_model.CpSolver()
@@ -1032,39 +1159,6 @@ def solve_schedule_slots(
         "gaps_2d": sum(solver.Value(v) for v in gaps_2d_vars),
     }
     return assignment, metrics
-
-
-def optimize_away_leg_ordering(
-    teams: List[Dict[str, Any]],
-    slots: List[Dict[str, Any]],
-    series_list: List[Dict[str, Any]],
-    assignment: Dict[int, int],
-    dist_matrix: List[List[int]],
-    season_year: int = 2027,
-) -> Dict[int, int]:
-    """Computes initial sequential venue-to-venue travel distance across all 30 teams."""
-    n_teams = len(teams)
-    active_slots = [s["slot_idx"] for s in slots if not s["is_asg"]]
-
-    def compute_total_miles(assign_map: Dict[int, int]) -> int:
-        slot_to_venue = {t: {} for t in range(n_teams)}
-        for sid, s in assign_map.items():
-            sr = series_list[sid]
-            h, a = sr["home"], sr["away"]
-            slot_to_venue[h][s] = h
-            slot_to_venue[a][s] = h
-        total = 0
-        for t in range(n_teams):
-            prev_v = t
-            for s in active_slots:
-                curr_v = slot_to_venue[t][s]
-                total += dist_matrix[prev_v][curr_v]
-                prev_v = curr_v
-        return total
-
-    base_miles = compute_total_miles(assignment)
-    print(f"Post-processing travel distance (initial league miles: {base_miles:,})...")
-    return assignment
 
 
 # ==============================================================================
@@ -2270,18 +2364,17 @@ def evaluate_existing_schedule(
     sorted_miles = sorted(team_metrics.items(), key=lambda x: x[1]["miles"], reverse=True)
 
     objective_score = (
-        100 * early_late_div_series
-        - 200 * isolated_homestands
-        - 450 * short_road_trips
+        150 * early_late_div_series
+        - 250 * isolated_homestands
+        - 400 * short_road_trips
         - 50 * road_trip_starts
-        - 1000 * len(missed_apr_list)
-        - 1000 * len(missed_sep_list)
+        - 1500 * len(missed_apr_list)
+        - 1500 * len(missed_sep_list)
         - 150 * asg_thu_games
         - 150 * excess_days_over_9
         - 100 * total_excess_dow
-        - 250 * tz_shifts_ge_2h
+        - 350 * tz_shifts_ge_2h
         - 100 * gaps_eq_2_days
-        - (total_miles // 10)
     )
 
     print("\n" + "=" * 76)
