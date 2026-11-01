@@ -535,6 +535,7 @@ class SolutionProgressCallback(cp_model.CpSolverSolutionCallback):
         miss_sep_vars: List[Any],
         asg_thu_vars: List[Any],
         streak_gt9_vars: List[Any],
+        consec_dow_vars: List[Any],
     ):
         super().__init__()
         self._div_vars = div_vars
@@ -545,6 +546,7 @@ class SolutionProgressCallback(cp_model.CpSolverSolutionCallback):
         self._miss_sep_vars = miss_sep_vars
         self._asg_thu_vars = asg_thu_vars
         self._streak_gt9_vars = streak_gt9_vars
+        self._consec_dow_vars = consec_dow_vars
         self._start_time = time.time()
         self._solution_count = 0
 
@@ -561,12 +563,14 @@ class SolutionProgressCallback(cp_model.CpSolverSolutionCallback):
         m_sep = sum(self.Value(v) for v in self._miss_sep_vars)
         asg_thu = sum(self.Value(v) for v in self._asg_thu_vars)
         strk_9 = sum(self.Value(v) for v in self._streak_gt9_vars)
+        dow_pen = sum(self.Value(v) for v in self._consec_dow_vars)
         print(
             f"  [Solution #{self._solution_count:02d} @ {elapsed:6.1f}s] "
             f"Obj: {obj:8.0f} (Bound: {bound:8.0f}) | "
             f"Miss Apr/Sep: {m_apr:2d}/{m_sep:2d} | "
             f"1-Ser H/A: {iso_h:2d}/{iso_a:2d} | "
-            f">9d Streak Pen: {strk_9:3d} | "
+            f">9d Streak: {strk_9:3d} | "
+            f"Mon/Thu Off Pen: {dow_pen:2d} | "
             f"ASG Thu: {asg_thu:2d} | "
             f"Early/Late Div: {div_cnt:3d} | "
             f"Road Trips: {rt_cnt:3d}"
@@ -691,9 +695,8 @@ def solve_schedule_slots(
                     model.Add(is_4g[t, s_a] + is_4g[t, s_b] <= 1)
 
     # --------------------------------------------------------------------------
-    # CONSECUTIVE WEEKS WITH MONDAY / THURSDAY OFF-DAYS (<= 3 in a row)
+    # SOFT PENALTY: > 3 Consecutive Weeks with Monday or Thursday Off-Days
     # --------------------------------------------------------------------------
-    # Collect standard regular weeks (excluding Opening weekend and ASG break)
     weeks_meta = []
     curr_s = 1
     while curr_s < len(slots) - 1:
@@ -703,6 +706,8 @@ def solve_schedule_slots(
             weeks_meta.append((s_a, s_b))
         curr_s += 2
 
+    consec_dow_off_penalties = []
+
     for t in range(n_teams):
         mon_off_vars = []
         thu_off_vars = []
@@ -711,31 +716,30 @@ def solve_schedule_slots(
             prev_s_b = weeks_meta[w_idx - 1][1] if w_idx > 0 else 0
             prev_wrap = slots[prev_s_b].get("is_monday_holiday_wrap", False)
 
-            # Monday off-day indicator: 1 if off, 0 if playing
             if prev_wrap or slots[s_a].get("holiday") == "July 4th":
-                # Monday is guaranteed occupied by holiday play
                 mon_off = model.NewConstant(0)
             else:
-                # Monday is off if the team does NOT play 4 games in Slot A
                 mon_off = model.NewBoolVar(f"mon_off_{t}_{w_idx}")
                 model.Add(mon_off == 1 - is_4g[t, s_a])
             mon_off_vars.append(mon_off)
 
-            # Thursday off-day indicator: 1 if off, 0 if playing
             if slots[s_b].get("shares_thu_with_prev", False):
-                # Weekend starts Thursday if team plays 4 games in Slot B
                 thu_off = model.NewBoolVar(f"thu_off_{t}_{w_idx}")
                 model.Add(thu_off == 1 - is_4g[t, s_b])
             else:
-                # Slot B doesn't share Thursday (e.g. Memorial/Labor wrap or force_3g)
-                # Thursday was played in Slot A
                 thu_off = model.NewConstant(0)
             thu_off_vars.append(thu_off)
 
-        # Hard constraints: no more than 3 consecutive weeks with Monday or Thursday off
+        # Soft penalties: trigger when a team has 4 consecutive weeks with Monday or Thursday off
         for i in range(len(mon_off_vars) - 3):
-            model.Add(sum(mon_off_vars[i:i + 4]) <= 3)
-            model.Add(sum(thu_off_vars[i:i + 4]) <= 3)
+            mon_pen = model.NewBoolVar(f"mon_pen_{t}_{i}")
+            model.Add(sum(mon_off_vars[i:i + 4]) - 3 <= mon_pen)
+            consec_dow_off_penalties.append(mon_pen)
+
+        for i in range(len(thu_off_vars) - 3):
+            thu_pen = model.NewBoolVar(f"thu_pen_{t}_{i}")
+            model.Add(sum(thu_off_vars[i:i + 4]) - 3 <= thu_pen)
+            consec_dow_off_penalties.append(thu_pen)
 
     # --------------------------------------------------------------------------
     # CONSECUTIVE PLAYING DAYS: Hard < 17 Days (<= 16 days), Soft Penalty > 9 Days
@@ -859,6 +863,7 @@ def solve_schedule_slots(
         - 500 * sum(missed_sept_vars)
         - 150 * sum(asg_thursday_4g_vars)
         - 150 * sum(streak_over_9_vars)
+        - 200 * sum(consec_dow_off_penalties)
     )
 
     solver = cp_model.CpSolver()
@@ -876,6 +881,7 @@ def solve_schedule_slots(
         missed_sept_vars,
         asg_thursday_4g_vars,
         streak_over_9_vars,
+        consec_dow_off_penalties,
     )
     print(f"Solving Phase 2 (workers={num_workers}, max_time={timeout_sec}s, gap_limit=1%)...")
     status = solver.Solve(model, callback)
@@ -898,6 +904,7 @@ def solve_schedule_slots(
     missed_sep_pairs = [f"{a}-{b}" for a, b, _, ms in div_pair_meta if solver.Value(ms) == 1]
     asg_thu_count = sum(solver.Value(v) for v in asg_thursday_4g_vars)
     streak_gt9_pen_count = sum(solver.Value(v) for v in streak_over_9_vars)
+    dow_pen_count = sum(solver.Value(v) for v in consec_dow_off_penalties)
 
     metrics = {
         "status": status_name,
@@ -912,6 +919,7 @@ def solve_schedule_slots(
         "missed_sept_list": missed_sep_pairs,
         "asg_thursday_games": asg_thu_count,
         "streak_gt9_penalty_days": streak_gt9_pen_count,
+        "consec_dow_off_penalties": dow_pen_count,
     }
     return assignment, metrics
 
@@ -1649,12 +1657,13 @@ def run_validation_checks(
         f"(Max streak: {max_streak}d | Streaks 10-16d: {len(streaks_10_to_16)} | Excess days >9: {excess_days_over_9})"
     )
 
-    # 3c. Verify Monday & Thursday Off-Day Spacing (Hard: <= 3 consecutive weeks)
+    # 3c. Check Monday & Thursday Off-Day Spacing (Soft Metric: > 3 consecutive weeks)
     mon_viols = compute_consecutive_dow_offdays(df, teams, "Monday")
     thu_viols = compute_consecutive_dow_offdays(df, teams, "Thursday")
-    assert len(mon_viols) == 0, f"Teams with >3 consecutive weeks of Monday off-days: {mon_viols}"
-    assert len(thu_viols) == 0, f"Teams with >3 consecutive weeks of Thursday off-days: {thu_viols}"
-    print("[PASS] No team has >3 consecutive weeks using Monday or Thursday as an off-day")
+    print(
+        f"[INFO] Monday off-days >3 wks in a row: {len(mon_viols)} teams {mon_viols} | "
+        f"Thursday off-days >3 wks in a row: {len(thu_viols)} teams {thu_viols}"
+    )
 
     # 3d. Check Timezone Shifts (>= 2 hours)
     tz_shifts = compute_timezone_shifts_ge_2h(df, teams)
@@ -2041,6 +2050,7 @@ def evaluate_existing_schedule(
     tz_shifts_ge_2h = compute_timezone_shifts_ge_2h(df, teams)
     mon_viols = compute_consecutive_dow_offdays(df, teams, "Monday")
     thu_viols = compute_consecutive_dow_offdays(df, teams, "Thursday")
+    dow_excess_weeks = sum(consec - 3 for _, consec in mon_viols) + sum(consec - 3 for _, consec in thu_viols)
 
     objective_score = (
         100 * early_late_div_series
@@ -2051,6 +2061,7 @@ def evaluate_existing_schedule(
         - 500 * len(missed_sep_list)
         - 150 * asg_thu_games
         - 150 * excess_days_over_9
+        - 200 * dow_excess_weeks
         - 75 * tz_shifts_ge_2h
         - 100 * gaps_eq_2_days
     )
@@ -2070,9 +2081,9 @@ def evaluate_existing_schedule(
     print(f"  6. Inter-Series Gap == 2 Days  : {gaps_eq_2_days} occurrences (Soft Penalty)")
     print(f"  7. Playing Streaks >= 17 Days  : {len(streaks_ge_17)} occurrences (Hard Constraint, Max={max_streak}d) {streaks_ge_17[:4]}")
     print(f"  8. Playing Streaks 10-16 Days  : {len(streaks_10_to_16)} streaks / {excess_days_over_9} excess days >9 (Soft Penalty)")
-    print(f"  9. Monday Off-Days > 3 wks in a row : {len(mon_viols)} teams {mon_viols}")
-    print(f" 10. Thursday Off-Days > 3 wks in a row: {len(thu_viols)} teams {thu_viols}")
-    print(f" 11. Timezone Shifts >= 2 Hours: {tz_shifts_ge_2h} occurrences (Soft Penalty)")
+    print(f"  9. Monday Off-Days > 3 wks in a row : {len(mon_viols)} teams {mon_viols} (Soft Penalty)")
+    print(f" 10. Thursday Off-Days > 3 wks in a row: {len(thu_viols)} teams {thu_viols} (Soft Penalty)")
+    print(f" 11. Timezone Shifts >= 2 Hours        : {tz_shifts_ge_2h} occurrences (Soft Penalty)")
     print(f" 12. Div Pairs >2 Series in 31d  : {len(div_31d_violations)} pairs {div_31d_violations}")
     print(f" 13. Div Pairs >3 Months Apart   : {len(div_3m_violations)} pairs {div_3m_violations}")
     print(f" 14. Long Road Trips (>3 series) : {long_road_trips} occurrences (Hard Constraint)")
