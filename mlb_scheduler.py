@@ -507,6 +507,7 @@ class SolutionProgressCallback(cp_model.CpSolverSolutionCallback):
         miss_apr_vars: List[Any],
         miss_sep_vars: List[Any],
         asg_thu_vars: List[Any],
+        streak_gt9_vars: List[Any],
     ):
         super().__init__()
         self._div_vars = div_vars
@@ -516,6 +517,7 @@ class SolutionProgressCallback(cp_model.CpSolverSolutionCallback):
         self._miss_apr_vars = miss_apr_vars
         self._miss_sep_vars = miss_sep_vars
         self._asg_thu_vars = asg_thu_vars
+        self._streak_gt9_vars = streak_gt9_vars
         self._start_time = time.time()
         self._solution_count = 0
 
@@ -531,11 +533,13 @@ class SolutionProgressCallback(cp_model.CpSolverSolutionCallback):
         m_apr = sum(self.Value(v) for v in self._miss_apr_vars)
         m_sep = sum(self.Value(v) for v in self._miss_sep_vars)
         asg_thu = sum(self.Value(v) for v in self._asg_thu_vars)
+        strk_9 = sum(self.Value(v) for v in self._streak_gt9_vars)
         print(
             f"  [Solution #{self._solution_count:02d} @ {elapsed:6.1f}s] "
             f"Obj: {obj:8.0f} (Bound: {bound:8.0f}) | "
             f"Miss Apr/Sep: {m_apr:2d}/{m_sep:2d} | "
             f"1-Ser H/A: {iso_h:2d}/{iso_a:2d} | "
+            f">9d Streak Pen: {strk_9:3d} | "
             f"ASG Thu: {asg_thu:2d} | "
             f"Early/Late Div: {div_cnt:3d} | "
             f"Road Trips: {rt_cnt:3d}"
@@ -554,7 +558,8 @@ def solve_schedule_slots(
 ) -> Tuple[Dict[int, int], Dict[str, Any]]:
     """
     Phase 2 CP-SAT Model:
-    Assigns all 780 series to the 52 active half-week slots.
+    Assigns all 780 series to the 52 active half-week slots, enforcing <= 14 consecutive
+    days played (hard) and penalizing > 9 consecutive days played (soft).
     """
     print("\nPhase 2: Building CP-SAT slot assignment and road-trip routing model...")
     t0 = time.time()
@@ -632,6 +637,7 @@ def solve_schedule_slots(
         pair_series.setdefault(pair_key, []).append(sid)
 
     is_home = {}
+    is_4g = {}
     for t in range(n_teams):
         for k, s in enumerate(active_slots):
             is_home[t, k] = model.NewBoolVar(f"home_{t}_{k}")
@@ -640,15 +646,109 @@ def solve_schedule_slots(
             model.AddExactlyOne(h_vars + a_vars)
             model.Add(sum(h_vars) == is_home[t, k])
 
+            f4_vars = [x[sid, s] for sid in four_game_series_by_team[t]]
+            if slots[s].get("force_3g", False) or not f4_vars:
+                is_4g[t, s] = 0
+            else:
+                b4 = model.NewBoolVar(f"is4g_{t}_{s}")
+                model.Add(sum(f4_vars) == b4)
+                is_4g[t, s] = b4
+
     # Hard No-Doubleheader Constraint
     for s_b in active_slots:
         if slots[s_b].get("shares_thu_with_prev", False):
             s_a = s_b - 1
             if s_a in active_slots:
                 for t in range(n_teams):
-                    f4_a = [x[sid, s_a] for sid in four_game_series_by_team[t]]
-                    f4_b = [x[sid, s_b] for sid in four_game_series_by_team[t]]
-                    model.Add(sum(f4_a + f4_b) <= 1)
+                    model.Add(is_4g[t, s_a] + is_4g[t, s_b] <= 1)
+
+    # --------------------------------------------------------------------------
+    # CONSECUTIVE PLAYING DAYS: Hard <= 14 Days, Soft Penalty for > 9 Days
+    # --------------------------------------------------------------------------
+    # Track whether each team plays on each calendar date from Opening Day to Finale.
+    # For any midweek Slot A where a 3g series could shift from [Tue,Wed,Thu] to [Mon,Tue,Wed]
+    # because the opponent has a 4g series in Slot B:
+    #   - If shifted: Mon=1, Tue=1, Wed=1, Thu=0 (Thursday is an off-day).
+    #   - If unshifted: Mon=0, Tue=1, Wed=1, Thu=1 (Monday is an off-day).
+    # In both cases, the 3g series has an off-day on either Monday or Thursday!
+    # However, a shift to [Mon,Tue,Wed] extends the PREVIOUS weekend's streak by 3 days (Mon-Wed)
+    # before Thursday's off-day. To guarantee even a shifted [Mon,Tue,Wed] never pushes a streak
+    # past 14 days, we also cap any streak ending on Sunday at <= 11 days whenever the following
+    # Slot A could shift, OR we explicitly model daily play indicators across the season.
+    season_start_date = slots[0]["dates_4g"][0]
+    season_end_date = slots[-1]["dates_4g"][-1]
+    total_cal_days = (season_end_date - season_start_date).days + 1
+    cal_dates = [season_start_date + datetime.timedelta(days=d) for d in range(total_cal_days)]
+
+    # Map each slot to its deterministic & conditional date occupancy
+    slot_by_idx = {s["slot_idx"]: s for s in slots}
+    streak_over_9_vars = []
+
+    for t in range(n_teams):
+        # play_day[d] is a linear expression (0, 1, or BoolVar) for whether team t plays on date d
+        play_day: Dict[datetime.date, Any] = {d: 0 for d in cal_dates}
+
+        for s in active_slots:
+            s_meta = slot_by_idx[s]
+            d3 = set(s_meta["dates_3g"])
+            d4 = set(s_meta["dates_4g"])
+            always_Dates = d3.intersection(d4)
+            only_4g_dates = d4 - d3
+
+            for d in always_Dates:
+                play_day[d] = 1
+            for d in only_4g_dates:
+                # Accumulate in case a date is referenced by adjacent slots (guarded by <=1 constraint)
+                play_day[d] = play_day[d] + is_4g[t, s]
+
+        # Enforce hard constraint: in any 15 consecutive calendar days, at most 14 days played
+        for d_idx in range(total_cal_days - 14):
+            win_15 = [play_day[cal_dates[d_idx + k]] for k in range(15)]
+            model.Add(sum(win_15) <= 14)
+
+        # Also guard against the 3-game [Mon,Tue,Wed] shift edge case:
+        # If a team plays 12+ consecutive days ending on a Sunday (which requires playing Friday of
+        # the week before + all 7 days of the current week = 10 days, or Thu-Sun + 7 days = 11 days,
+        # or Tue-Sun + 7 days = 13 days), and then shifts its 3g series in the next Slot A to
+        # [Mon,Tue,Wed], it would play Mon-Wed (3 days) before getting Thursday off (13 + 3 = 16 days!).
+        # That happens if and only if in week w the team had NO off-day (played Mon-Sun = 7 days),
+        # played Tue-Sun of week w-1 (6 days, so 13 days ending Sunday), AND shifted in week w+1.
+        # Even simpler and stronger: a team cannot have TWO consecutive full weeks without an off-day,
+        # AND if a team has a full 7-day week (Mon-Sun with no off-day), neither it nor its Slot A
+        # opponent in the next week can trigger a 15-day stretch.
+        # Let's check: in a normal week (Mon-Sun), a team plays all 7 days iff play_day[Mon] + play_day[Thu] == 2.
+        # If we forbid playing all 7 days in week w AND playing Thu-Sun in week w-1 (4g in W_{w-1}_B or 3g+4g),
+        # wait: Thu-Sun (4 days) + Mon-Sun (7 days) + Mon-Wed (3 days) = 14 days!
+        # It only hits 15 days if the team played Wed-Sun in week w-1 (at least 5 days) + Mon-Sun in week w (7 days)
+        # + Mon-Wed in week w+1 (3 days) = 5 + 7 + 3 = 15 days!
+        # And playing Wed-Sun in week w-1 is ONLY possible if the team had NO off-day on Thursday of week w-1!
+        # Therefore, if a team has NO off-day on Thursday of week w-1 AND NO off-day in all of week w (Mon & Thu both played),
+        # its streak ending Sunday of week w is 6 + 7 = 13 days (if Monday w-1 was off) or 12 days (if Wed-Sun).
+        # To strictly prevent a [Mon,Tue,Wed] shift in week w+1 from turning a 12 or 13 day streak into 15 or 16 days,
+        # we simply prohibit (Thu_{w-1} played) + (Mon_w played) + (Thu_w played) == 3!
+        # Wait: if Thu_{w-1} + Mon_w + Thu_w <= 2, then a team NEVER plays Tue_{w-1} through Sun_w (13 days) straight!
+        # The maximum streak ending on any Sunday is then Fri_{w-1}..Sun_w (10 days), so even +3 days (Mon-Wed shift) is at most 13 days!
+        for k_idx in range(1, len(active_slots) - 1):
+            s_curr = active_slots[k_idx]
+            s_meta = slot_by_idx[s_curr]
+            if s_meta["slot_type"] == "A" and not s_meta["is_asg"]:
+                mon_d = s_meta["dates_4g"][0]
+                thu_d = s_meta["dates_4g"][-1]
+                prev_thu_d = mon_d - datetime.timedelta(days=4)
+                if prev_thu_d in play_day and mon_d in play_day and thu_d in play_day:
+                    # Prevents Tue(w-1)..Sun(w) 13-day streak + Mon..Wed(w+1) shift = 16 days
+                    model.Add(play_day[prev_thu_d] + play_day[mon_d] + play_day[thu_d] <= 2)
+
+        # Soft penalty for any streak > 9 consecutive days:
+        # Every 10-day window where all 10 days are played adds 1 penalty unit.
+        for d_idx in range(total_cal_days - 9):
+            win_10 = [play_day[cal_dates[d_idx + k]] for k in range(10)]
+            # Skip windows that span the All-Star Break (where 3 days are guaranteed 0)
+            if any(isinstance(v, int) and v == 0 for v in win_10):
+                continue
+            ov9 = model.NewBoolVar(f"strk_gt9_{t}_{d_idx}")
+            model.Add(ov9 >= sum(win_10) - 9)
+            streak_over_9_vars.append(ov9)
 
     missed_april_vars = []
     missed_sept_vars = []
@@ -733,6 +833,7 @@ def solve_schedule_slots(
         - 500 * sum(missed_april_vars)
         - 500 * sum(missed_sept_vars)
         - 150 * sum(asg_thursday_4g_vars)
+        - 150 * sum(streak_over_9_vars)
     )
 
     solver = cp_model.CpSolver()
@@ -749,6 +850,7 @@ def solve_schedule_slots(
         missed_april_vars,
         missed_sept_vars,
         asg_thursday_4g_vars,
+        streak_over_9_vars,
     )
     print(f"Solving Phase 2 (workers={num_workers}, max_time={timeout_sec}s, gap_limit=1%)...")
     status = solver.Solve(model, callback)
@@ -770,6 +872,7 @@ def solve_schedule_slots(
     missed_apr_pairs = [f"{a}-{b}" for a, b, ma, _ in div_pair_meta if solver.Value(ma) == 1]
     missed_sep_pairs = [f"{a}-{b}" for a, b, _, ms in div_pair_meta if solver.Value(ms) == 1]
     asg_thu_count = sum(solver.Value(v) for v in asg_thursday_4g_vars)
+    streak_gt9_pen_count = sum(solver.Value(v) for v in streak_over_9_vars)
 
     metrics = {
         "status": status_name,
@@ -783,6 +886,7 @@ def solve_schedule_slots(
         "missed_april_list": missed_apr_pairs,
         "missed_sept_list": missed_sep_pairs,
         "asg_thursday_games": asg_thu_count,
+        "streak_gt9_penalty_days": streak_gt9_pen_count,
     }
     return assignment, metrics
 
@@ -1028,10 +1132,10 @@ def generate_team_schedule_pdfs(
           Row 0: March / April (combined) | May
           Row 1: June                     | July
           Row 2: August                   | September (or September / October if games in Oct)
-      - White background for all games to provide high contrast for logos.
-      - Extra thick navy blue border (#0A1E3F, 2.2 pt) for Home games; thin border for Road games.
-      - Tuesday All-Star Game (ASG) highlighted with a gold badge; Mon/Wed/Thu ASG Break shaded.
-      - Clean date number in top-left; Opponent logo/text badge in center (no debug subtitle text).
+      - White background for regular games; Yellow background (#FEF08A) for Doubleheaders.
+      - Inset thick navy blue border (#0A1E3F, 3.0 pt) for Home games; thin border for Road games.
+      - Tuesday All-Star Game (ASG) highlighted with a true gold badge; Mon/Wed/Thu ASG Break shaded.
+      - Clean date number in top-left; Opponent logo/text badge in center.
     """
     os.makedirs(output_dir, exist_ok=True)
     logo_map = fetch_or_cache_team_logos(teams, output_dir=output_dir, enable_logos=enable_logos)
@@ -1041,9 +1145,11 @@ def generate_team_schedule_pdfs(
     light_gray = colors.HexColor("#F2F4F7")
     border_gray = colors.HexColor("#CBD2D9")
     muted_text = colors.HexColor("#7B8794")
-    gold_bg = colors.HexColor("#D97706")       # Rich amber/gold for ASG
-    asg_break_bg = colors.HexColor("#FEF3C7")  # Warm soft cream for ASG Break
-    asg_break_text = colors.HexColor("#92400E")
+    gold_bg = colors.HexColor("#F5C518")             # True bright gold for ASG
+    gold_border = colors.HexColor("#D4AF37")         # Metallic gold border for ASG
+    asg_break_bg = colors.HexColor("#FEF9C3")        # Soft cream for ASG Break
+    asg_break_text = colors.HexColor("#854D0E")
+    doubleheader_bg = colors.HexColor("#FEF08A")     # Warm yellow for scheduled doubleheaders
     dow_letters = ["S", "M", "T", "W", "T", "F", "S"]
 
     page_w, page_h = letter  # 612 x 792 pt portrait
@@ -1054,6 +1160,9 @@ def generate_team_schedule_pdfs(
     asg_thu = asg_mon + datetime.timedelta(days=3)
     asg_break_days = {asg_mon, asg_wed}
 
+    home_border_w = 3.0
+    half_hb = home_border_w / 2.0
+
     for t in teams:
         abbr = t["abbr"]
         team_name = t["name"]
@@ -1063,15 +1172,16 @@ def generate_team_schedule_pdfs(
         t_df["DateObj"] = pd.to_datetime(t_df["Date"]).dt.date
         t_df = t_df.sort_values("DateObj").reset_index(drop=True)
 
-        game_by_date: Dict[datetime.date, Dict[str, Any]] = {}
+        # Support multiple games on the same calendar date (e.g., official doubleheaders)
+        game_by_date: Dict[datetime.date, List[Dict[str, Any]]] = {}
         for _, row in t_df.iterrows():
             d = row["DateObj"]
             is_home = (row["HomeTeam"] == abbr)
             opp = row["AwayTeam"] if is_home else row["HomeTeam"]
-            game_by_date[d] = {
+            game_by_date.setdefault(d, []).append({
                 "is_home": is_home,
                 "opp": opp,
-            }
+            })
 
         min_date = min(t_df["DateObj"]) if not t_df.empty else datetime.date(season_year, 3, 25)
         max_date = max(t_df["DateObj"]) if not t_df.empty else datetime.date(season_year, 9, 26)
@@ -1102,29 +1212,36 @@ def generate_team_schedule_pdfs(
         c.setFont("Helvetica-Bold", 10)
         c.drawRightString(page_w - 30, page_h - 33, "REGULAR SEASON CALENDAR")
 
-        # Compact Legend Bar: Thick navy border for Home, Thin border for Road, Gold for ASG
+        # Compact Legend Bar: Thick navy border for Home, Thin border for Road, Yellow for DH, Gold for ASG
         legend_y = page_h - 58
         c.setFillColor(colors.white)
         c.setStrokeColor(navy)
         c.setLineWidth(2.2)
         c.rect(20, legend_y, 11, 11, fill=1, stroke=1)
         c.setFillColor(colors.black)
-        c.setFont("Helvetica-Bold", 8)
-        c.drawString(36, legend_y + 2, "HOME (Thick Navy Border)")
+        c.setFont("Helvetica-Bold", 7.5)
+        c.drawString(34, legend_y + 2, "HOME (Navy Border)")
 
         c.setFillColor(colors.white)
         c.setStrokeColor(border_gray)
         c.setLineWidth(0.5)
-        c.rect(160, legend_y, 11, 11, fill=1, stroke=1)
+        c.rect(130, legend_y, 11, 11, fill=1, stroke=1)
         c.setFillColor(colors.black)
-        c.drawString(176, legend_y + 2, "ROAD (Thin Border)")
+        c.drawString(144, legend_y + 2, "ROAD (Thin)")
 
-        c.setFillColor(gold_bg)
+        c.setFillColor(doubleheader_bg)
         c.setStrokeColor(border_gray)
         c.setLineWidth(0.5)
-        c.rect(265, legend_y, 11, 11, fill=1, stroke=1)
+        c.rect(202, legend_y, 11, 11, fill=1, stroke=1)
         c.setFillColor(colors.black)
-        c.drawString(281, legend_y + 2, "ALL-STAR GAME (Gold)")
+        c.drawString(216, legend_y + 2, "DOUBLEHEADER (Yellow)")
+
+        c.setFillColor(gold_bg)
+        c.setStrokeColor(gold_border)
+        c.setLineWidth(0.8)
+        c.rect(328, legend_y, 11, 11, fill=1, stroke=1)
+        c.setFillColor(colors.black)
+        c.drawString(342, legend_y + 2, "ALL-STAR GAME (Gold)")
 
         # 2 Columns x 3 Rows Geometry (Left-to-right, then top-to-bottom)
         margin_x = 20.0
@@ -1175,76 +1292,102 @@ def generate_team_schedule_pdfs(
                 for d_idx in range(7):
                     cx = bx + d_idx * cell_w
                     in_period = (curr_d.month in active_months) and (p_start <= curr_d <= p_end)
-                    g_info = game_by_date.get(curr_d) if in_period else None
+                    games_today = game_by_date.get(curr_d, []) if in_period else []
 
                     if not in_period:
                         c.setFillColor(light_gray)
                         c.setStrokeColor(border_gray)
                         c.setLineWidth(0.5)
                         c.rect(cx, wy, cell_w, cell_h, fill=1, stroke=1)
-                    elif g_info is not None:
-                        # White background for ALL games for perfect logo contrast!
-                        c.setFillColor(colors.white)
-                        if g_info["is_home"]:
-                            # Extra thick navy blue border for HOME games
-                            c.setStrokeColor(navy)
-                            c.setLineWidth(4.2)
-                        else:
-                            # Thin border for ROAD games
-                            c.setStrokeColor(border_gray)
-                            c.setLineWidth(0.5)
+                    elif games_today:
+                        is_dh = len(games_today) >= 2
+                        has_home = any(g["is_home"] for g in games_today)
+
+                        # Yellow background for doubleheaders; clean white for single games
+                        c.setFillColor(doubleheader_bg if is_dh else colors.white)
+                        c.setStrokeColor(border_gray)
+                        c.setLineWidth(0.5)
                         c.rect(cx, wy, cell_w, cell_h, fill=1, stroke=1)
 
+                        # Inset thick navy border if at least one game is at home
+                        if has_home:
+                            c.setStrokeColor(navy)
+                            c.setLineWidth(home_border_w)
+                            c.rect(
+                                cx + half_hb,
+                                wy + half_hb,
+                                cell_w - home_border_w,
+                                cell_h - home_border_w,
+                                fill=0,
+                                stroke=1,
+                            )
+
                         # Date number in top-left
-                        c.setFillColor(navy if g_info["is_home"] else colors.HexColor("#243B53"))
+                        c.setFillColor(navy if has_home else colors.HexColor("#243B53"))
                         c.setFont("Helvetica-Bold", 6.5)
                         date_lbl = (
                             f"{curr_d.strftime('%b')[:1]}{curr_d.day}"
                             if len(active_months) > 1 and curr_d.day == 1
                             else str(curr_d.day)
                         )
-                        c.drawString(cx + 2.5, wy + cell_h - 7.5, date_lbl)
+                        text_pad_x = 3.5 if has_home else 2.5
+                        text_pad_y = 8.5 if has_home else 7.5
+                        c.drawString(cx + text_pad_x, wy + cell_h - text_pad_y, date_lbl)
 
-                        # Clean Opponent badge in center (Logo or Bold Text)
-                        opp_abbr = g_info["opp"]
-                        logo_file = logo_map.get(opp_abbr)
+                        if is_dh:
+                            # DH indicator tag in top-right corner
+                            c.setFillColor(colors.HexColor("#854D0E"))
+                            c.setFont("Helvetica-Bold", 5.5)
+                            c.drawRightString(cx + cell_w - (3.5 if has_home else 2.5), wy + cell_h - text_pad_y, "DH")
 
-                        if logo_file and os.path.exists(logo_file):
-                            img_size = min(cell_w * 0.58, cell_h * 0.65)
-                            img_x = cx + (cell_w - img_size) / 2.0
-                            img_y = wy + (cell_h - img_size) / 2.0 - 1.5
-                            try:
-                                c.drawImage(
-                                    logo_file,
-                                    img_x,
-                                    img_y,
-                                    width=img_size,
-                                    height=img_size,
-                                    mask="auto",
-                                    preserveAspectRatio=True,
-                                )
-                            except Exception:
+                            # Render stacked double-header opponents
+                            opp1 = games_today[0]["opp"]
+                            opp2 = games_today[1]["opp"]
+                            c.setFillColor(navy)
+                            c.setFont("Helvetica-Bold", 6.5)
+                            c.drawCentredString(cx + cell_w / 2.0, wy + cell_h / 2.0 + 1.0, f"G1: {opp1}")
+                            c.drawCentredString(cx + cell_w / 2.0, wy + cell_h / 2.0 - 6.5, f"G2: {opp2}")
+                        else:
+                            # Standard single game: Logo or bold text in center
+                            opp_abbr = games_today[0]["opp"]
+                            logo_file = logo_map.get(opp_abbr)
+
+                            if logo_file and os.path.exists(logo_file):
+                                img_size = min(cell_w * 0.56, cell_h * 0.62)
+                                img_x = cx + (cell_w - img_size) / 2.0
+                                img_y = wy + (cell_h - img_size) / 2.0 - 1.5
+                                try:
+                                    c.drawImage(
+                                        logo_file,
+                                        img_x,
+                                        img_y,
+                                        width=img_size,
+                                        height=img_size,
+                                        mask="auto",
+                                        preserveAspectRatio=True,
+                                    )
+                                except Exception:
+                                    c.setFillColor(navy)
+                                    c.setFont("Helvetica-Bold", 8.5)
+                                    c.drawCentredString(cx + cell_w / 2.0, wy + cell_h / 2.0 - 4.0, opp_abbr)
+                            else:
                                 c.setFillColor(navy)
                                 c.setFont("Helvetica-Bold", 8.5)
                                 c.drawCentredString(cx + cell_w / 2.0, wy + cell_h / 2.0 - 4.0, opp_abbr)
-                        else:
-                            c.setFillColor(navy)
-                            c.setFont("Helvetica-Bold", 8.5)
-                            c.drawCentredString(cx + cell_w / 2.0, wy + cell_h / 2.0 - 4.0, opp_abbr)
                     elif curr_d == asg_date:
-                        # All-Star Game Tuesday: highlighted in rich gold with ASG badge
+                        # All-Star Game Tuesday: highlighted in true gold with navy ASG text
                         c.setFillColor(gold_bg)
-                        c.setStrokeColor(border_gray)
-                        c.setLineWidth(0.5)
+                        c.setStrokeColor(gold_border)
+                        c.setLineWidth(0.8)
                         c.rect(cx, wy, cell_w, cell_h, fill=1, stroke=1)
 
-                        c.setFillColor(colors.white)
+                        c.setFillColor(navy)
                         c.setFont("Helvetica-Bold", 6.5)
                         c.drawString(cx + 2.5, wy + cell_h - 7.5, str(curr_d.day))
 
                         c.setFont("Helvetica-Bold", 8.0)
                         c.drawCentredString(cx + cell_w / 2.0, wy + cell_h / 2.0 - 3.5, "ASG")
-                    elif curr_d in asg_break_days or (curr_d == asg_thu and g_info is None):
+                    elif curr_d in asg_break_days or (curr_d == asg_thu and not games_today):
                         # Core All-Star Break days: soft warm cream with Break label
                         c.setFillColor(asg_break_bg)
                         c.setStrokeColor(border_gray)
@@ -1278,6 +1421,67 @@ def generate_team_schedule_pdfs(
         c.save()
 
     print(f"Generated 30 1-page team schedule PDFs in '{output_dir}/mlb_schedule_<TEAM>_<SEASON>.pdf'.")
+
+
+def compute_team_playing_streaks(
+    df: pd.DataFrame,
+    teams: List[Dict[str, Any]],
+) -> Tuple[int, List[Tuple[str, str, str, int]], List[Tuple[str, str, str, int]], int]:
+    """
+    Computes consecutive playing day streaks for all 30 teams from a daily schedule DataFrame.
+    Returns:
+      - max_streak: longest streak of consecutive days played by any team
+      - streaks_gt_14: list of (team, start_date, end_date, length) for streaks > 14 days
+      - streaks_10_to_14: list of (team, start_date, end_date, length) for streaks of 10..14 days
+      - excess_days_over_9: sum of (length - 9) across all streaks > 9 days
+    """
+    df_temp = df.copy()
+    df_temp["DateObj"] = pd.to_datetime(df_temp["Date"]).dt.date
+
+    max_streak = 0
+    streaks_gt_14: List[Tuple[str, str, str, int]] = []
+    streaks_10_to_14: List[Tuple[str, str, str, int]] = []
+    excess_days_over_9 = 0
+
+    for t in teams:
+        abbr = t["abbr"]
+        t_dates = sorted(
+            set(df_temp[(df_temp["HomeTeam"] == abbr) | (df_temp["AwayTeam"] == abbr)]["DateObj"].tolist())
+        )
+        if not t_dates:
+            continue
+
+        s_start = t_dates[0]
+        s_prev = t_dates[0]
+        s_len = 1
+
+        for d in t_dates[1:]:
+            if (d - s_prev).days == 1:
+                s_len += 1
+                s_prev = d
+            else:
+                if s_len > max_streak:
+                    max_streak = s_len
+                if s_len > 9:
+                    excess_days_over_9 += (s_len - 9)
+                    if s_len > 14:
+                        streaks_gt_14.append((abbr, s_start.isoformat(), s_prev.isoformat(), s_len))
+                    else:
+                        streaks_10_to_14.append((abbr, s_start.isoformat(), s_prev.isoformat(), s_len))
+                s_start = d
+                s_prev = d
+                s_len = 1
+
+        if s_len > max_streak:
+            max_streak = s_len
+        if s_len > 9:
+            excess_days_over_9 += (s_len - 9)
+            if s_len > 14:
+                streaks_gt_14.append((abbr, s_start.isoformat(), s_prev.isoformat(), s_len))
+            else:
+                streaks_10_to_14.append((abbr, s_start.isoformat(), s_prev.isoformat(), s_len))
+
+    return max_streak, streaks_gt_14, streaks_10_to_14, excess_days_over_9
 
 
 def run_validation_checks(
@@ -1345,6 +1549,14 @@ def run_validation_checks(
     print(
         f"[PASS] All inter-series gaps outside All-Star Break are <= 2 off-days "
         f"(2-off-day gaps league-wide: {len(two_day_gaps)})"
+    )
+
+    # 3b. Verify Consecutive Playing Days (Hard: <= 14 consecutive days; Soft: > 9 consecutive days)
+    max_streak, streaks_gt_14, streaks_10_to_14, excess_days_over_9 = compute_team_playing_streaks(df, teams)
+    assert len(streaks_gt_14) == 0, f"Found playing streaks > 14 consecutive days: {streaks_gt_14[:5]}"
+    print(
+        f"[PASS] All teams play <= 14 consecutive days before an off-day "
+        f"(Max streak: {max_streak}d | Streaks 10-14d: {len(streaks_10_to_14)} | Excess days >9: {excess_days_over_9})"
     )
 
     # 4. Verify Divisional Spacing Rules (<= 2 series in any 31-day span, and <= 95 days between consecutive series)
@@ -1573,6 +1785,8 @@ def evaluate_existing_schedule(
     dup_rows = team_dates[team_dates.duplicated(subset=["Date", "Team"], keep=False)]
     num_doubleheaders = len(dup_rows) // 2
 
+    max_streak, streaks_gt_14, streaks_10_to_14, excess_days_over_9 = compute_team_playing_streaks(df, teams)
+
     df_sorted = df.sort_values(by=["DateObj", "HomeTeam", "AwayTeam"]).reset_index(drop=True)
     active_series: Dict[Tuple[str, str], Dict[str, Any]] = {}
     reconstructed_series: List[Dict[str, Any]] = []
@@ -1732,6 +1946,7 @@ def evaluate_existing_schedule(
         - 500 * len(missed_apr_list)
         - 500 * len(missed_sep_list)
         - 150 * asg_thu_games
+        - 150 * excess_days_over_9
         - 100 * gaps_eq_2_days
     )
 
@@ -1743,21 +1958,23 @@ def evaluate_existing_schedule(
     print("-" * 76)
     print("HARD & SOFT CONSTRAINT AUDIT BREAKDOWN:")
     print(f"  1. Teams off 81H/81A Balance   : {len(imbalanced_teams)} {imbalanced_teams[:6]}")
-    print(f"  2. Doubleheaders (Same Date)   : {num_doubleheaders} team-date collisions")
-    print(f"  3. Series != 3 or 4 Games      : {len(non_3_4_series)} series")
-    print(f"  4. Non-Opening Series w/ Gap   : {len(internal_gap_series)} series")
+    print(f"  2. Doubleheaders (Same Date)   : {num_doubleheaders} team-date collisions {dup_rows}")
+    print(f"  3. Series != 3 or 4 Games      : {len(non_3_4_series)} series {non_3_4_series}")
+    print(f"  4. Non-Opening Series w/ Gap   : {len(internal_gap_series)} series {internal_gap_series}")
     print(f"  5. Inter-Series Gap > 2 Days   : {gaps_gt_2_days} occurrences (Hard Constraint)")
     print(f"  6. Inter-Series Gap == 2 Days  : {gaps_eq_2_days} occurrences (Soft Penalty)")
-    print(f"  7. Div Pairs >2 Series in 31d  : {len(div_31d_violations)} pairs {div_31d_violations[:6]}")
-    print(f"  8. Div Pairs >3 Months Apart   : {len(div_3m_violations)} pairs {div_3m_violations[:6]}")
-    print(f"  9. Long Road Trips (>3 series) : {long_road_trips} occurrences (Hard Constraint)")
-    print(f" 10. Long Homestands (>3 series) : {long_homestands} occurrences (Hard Constraint)")
-    print(f" 11. 1-Series Road Trips (==1)   : {short_road_trips} occurrences (Soft Penalty)")
-    print(f" 12. 1-Series Homestands (==1)   : {isolated_homestands} occurrences (Soft Penalty)")
-    print(f" 13. Missed April Div Matchups   : {len(missed_apr_list)} / 60 pairs {missed_apr_list[:8]}")
-    print(f" 14. Missed Sept Div Matchups    : {len(missed_sep_list)} / 60 pairs {missed_sep_list[:8]}")
-    print(f" 15. ASG Core Games (Mon-Wed)    : {asg_core_games} games")
-    print(f" 16. ASG Thursday Games          : {asg_thu_games} games (Soft Penalty)")
+    print(f"  7. Playing Streaks > 14 Days   : {len(streaks_gt_14)} occurrences (Hard Constraint, Max={max_streak}d) {streaks_gt_14[:4]}")
+    print(f"  8. Playing Streaks 10-14 Days  : {len(streaks_10_to_14)} streaks / {excess_days_over_9} excess days >9 (Soft Penalty)")
+    print(f"  9. Div Pairs >2 Series in 31d  : {len(div_31d_violations)} pairs {div_31d_violations}")
+    print(f" 10. Div Pairs >3 Months Apart   : {len(div_3m_violations)} pairs {div_3m_violations}")
+    print(f" 11. Long Road Trips (>3 series) : {long_road_trips} occurrences (Hard Constraint)")
+    print(f" 12. Long Homestands (>3 series) : {long_homestands} occurrences (Hard Constraint)")
+    print(f" 13. 1-Series Road Trips (==1)   : {short_road_trips} occurrences (Soft Penalty)")
+    print(f" 14. 1-Series Homestands (==1)   : {isolated_homestands} occurrences (Soft Penalty)")
+    print(f" 15. Missed April Div Matchups   : {len(missed_apr_list)} / 60 pairs {missed_apr_list}")
+    print(f" 16. Missed Sept Div Matchups    : {len(missed_sep_list)} / 60 pairs {missed_sep_list}")
+    print(f" 17. ASG Core Games (Mon-Wed)    : {asg_core_games} games")
+    print(f" 18. ASG Thursday Games          : {asg_thu_games} games (Soft Penalty)")
     print("-" * 76)
     print("OBJECTIVE FUNCTION SCORE & COMPONENTS:")
     print(f"  + Early/Late Divisional Series : {early_late_div_series:4d}  (x +100 = {100 * early_late_div_series:+8d})")
@@ -1767,6 +1984,7 @@ def evaluate_existing_schedule(
     print(f"  - Missed April Div Pairs       : {len(missed_apr_list):4d}  (x -500 = {-500 * len(missed_apr_list):+8d})")
     print(f"  - Missed Sept Div Pairs        : {len(missed_sep_list):4d}  (x -500 = {-500 * len(missed_sep_list):+8d})")
     print(f"  - ASG Thursday Games           : {asg_thu_games:4d}  (x -150 = {-150 * asg_thu_games:+8d})")
+    print(f"  - Excess Playing Days (>9d)    : {excess_days_over_9:4d}  (x -150 = {-150 * excess_days_over_9:+8d})")
     print(f"  - 2-Day Inter-Series Gaps      : {gaps_eq_2_days:4d}  (x -100 = {-100 * gaps_eq_2_days:+8d})")
     print(f"  ==========================================================================")
     print(f"  TOTAL CP-SAT OBJECTIVE SCORE   : {objective_score:,}")
@@ -1852,6 +2070,7 @@ def main(
     print(f"Missed April Div Pairs      : {metrics['missed_april_pairs']} / 60 ({metrics['missed_april_list']})")
     print(f"Missed Sept Div Pairs       : {metrics['missed_sept_pairs']} / 60 ({metrics['missed_sept_list']})")
     print(f"ASG Thursday Early Games    : {metrics['asg_thursday_games']} games")
+    print(f"Excess Playing Days (>9d)   : {metrics['streak_gt9_penalty_days']} penalty days")
     print(f"Isolated 1-Series Homestands: {metrics['isolated_homestands']} league-wide")
     print(f"Isolated 1-Series Road Trips: {metrics['isolated_road_trips']} league-wide")
     print(f"Total League Travel Distance: {total_league_miles:,} miles")

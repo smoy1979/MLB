@@ -25,7 +25,7 @@
                 "PYTHONPATH": "${workspaceFolder}",
             },
             "args": [
-                "--evaluate-year=2026"
+                "--evaluate-year=2027"
             ]
         }
     ]
