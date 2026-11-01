@@ -909,6 +909,8 @@ def solve_schedule_slots(
     missed_april_vars = []
     missed_sept_vars = []
     div_pair_meta = []
+    div_31d_pen_vars = []
+    div_91d_pen_vars = []
 
     for (t1, t2), sids in pair_series.items():
         if teams[t1]["division"] == teams[t2]["division"]:
@@ -927,22 +929,40 @@ def solve_schedule_slots(
                 s_curr, s_next = active_slots[k], active_slots[k + 1]
                 model.Add(sum(x[sid, s_curr] + x[sid, s_next] for sid in sids) <= 1)
 
-            # Hard: Max 2 series vs same divisional opponent in any 31-day span
-            for win_31 in windows_31d:
-                model.Add(sum(x[sid, s] for sid in sids for s in win_31) <= 2)
+            # Soft: > 2 series vs same divisional opponent in any 31-day span
+            for w_idx, win_31 in enumerate(windows_31d):
+                ov_31 = model.NewBoolVar(f"div31_{t1}_{t2}_{w_idx}")
+                model.Add(sum(x[sid, s] for sid in sids for s in win_31) - 2 <= ov_31)
+                model.Add(sum(x[sid, s] for sid in sids for s in win_31) <= 3)
+                div_31d_pen_vars.append(ov_31)
 
-            # Hard: At least 1 series in every 3-month (91-day) window
-            for win_91 in windows_91d:
-                model.Add(sum(x[sid, s] for sid in sids for s in win_91) >= 1)
+            # Soft: 0 series in any 3-month (91-day) window
+            for w_idx, win_91 in enumerate(windows_91d):
+                miss_91 = model.NewBoolVar(f"div91_{t1}_{t2}_{w_idx}")
+                model.Add(sum(x[sid, s] for sid in sids for s in win_91) + miss_91 >= 1)
+                div_91d_pen_vars.append(miss_91)
 
     isolated_home_vars = []
     isolated_away_vars = []
+    long_home_vars = []
+    long_away_vars = []
 
     for t in range(n_teams):
+        # Hard cap: never allow 5 consecutive Home or 5 consecutive Away series (max 4)
+        for k in range(n_active - 4):
+            win5 = [is_home[t, k + d] for d in range(5)]
+            model.Add(sum(win5) <= 4)
+            model.Add(sum(win5) >= 1)
+
+        # Soft penalty: 4 consecutive Home or 4 consecutive Away series (> 3 series)
         for k in range(n_active - 3):
             window = [is_home[t, k + d] for d in range(4)]
-            model.Add(sum(window) <= 3)
-            model.Add(sum(window) >= 1)
+            lh = model.NewBoolVar(f"long_h_{t}_{k}")
+            la = model.NewBoolVar(f"long_a_{t}_{k}")
+            model.Add(sum(window) - 3 <= lh)
+            model.Add(1 - sum(window) <= la)
+            long_home_vars.append(lh)
+            long_away_vars.append(la)
 
         iso_a_start = model.NewBoolVar(f"iso_a_start_{t}")
         model.Add(iso_a_start >= is_home[t, 1] - is_home[t, 0])
@@ -984,31 +1004,25 @@ def solve_schedule_slots(
     # --------------------------------------------------------------------------
     # TIME ZONE SHIFTS (>= 2 Hours)
     # --------------------------------------------------------------------------
-    # Map venue index h to its absolute timezone code: EDT=0, CDT=1, MDT/MST=2, PDT=3
     venue_tz_val = [abs(TEAM_TIMEZONES.get(teams[h]["abbr"], 0)) for h in range(n_teams)]
 
     tz_shifts_ge2_vars = []
     for t in range(n_teams):
-        # venue_tz[k] is an integer expression for team t's venue timezone in active slot k
-        # Computed linearly from sum(tz * x[sid, s]) across all series team t participates in
         t_sids = home_series_by_team[t] + away_series_by_team[t]
 
         for k in range(n_active - 1):
             s_curr, s_next = active_slots[k], active_slots[k + 1]
-            # Skip across All-Star Break
             if (s_next - s_curr) > 1:
                 continue
 
             tz_curr = sum(venue_tz_val[series_list[sid]["home"]] * x[sid, s_curr] for sid in t_sids)
             tz_next = sum(venue_tz_val[series_list[sid]["home"]] * x[sid, s_next] for sid in t_sids)
 
-            # Absolute timezone difference between consecutive series venues in [0..3]
             tz_diff = model.NewIntVar(-3, 3, f"tz_diff_{t}_{k}")
             model.Add(tz_diff == tz_next - tz_curr)
             tz_abs = model.NewIntVar(0, 3, f"tz_abs_{t}_{k}")
             model.AddAbsEquality(tz_abs, tz_diff)
 
-            # Flag when tz_abs >= 2 (forces tz_ge2 = 1 when diff is 2 or 3; solver minimizes to 0 otherwise)
             tz_ge2 = model.NewBoolVar(f"tz_ge2_{t}_{k}")
             model.Add(tz_abs - 1 <= 2 * tz_ge2)
             tz_shifts_ge2_vars.append(tz_ge2)
@@ -1016,81 +1030,32 @@ def solve_schedule_slots(
     # --------------------------------------------------------------------------
     # 2-DAY OFF-DAY GAPS (Inter-series gaps == 2 days)
     # --------------------------------------------------------------------------
-    # A 2-day gap happens when two consecutive series are both 3-game series (is_4g == 0 for both)
-    # Outside holiday wraps, neither series playing 4 games leaves an extra day idle
     gaps_2d_vars = []
     for t in range(n_teams):
         for k in range(n_active - 1):
             s1, s2 = active_slots[k], active_slots[k + 1]
-            # Skip across All-Star Break
             if (s2 - s1) > 1:
                 continue
 
-            # Slot A -> Slot B: both 3g series leaves Thursday as an off-day
             if slots[s1]["slot_type"] == "A" and slots[s2]["slot_type"] == "B":
                 g2 = model.NewBoolVar(f"g2_{t}_{k}")
-                # Forces g2 = 1 when is_4g[t, s1] == 0 and is_4g[t, s2] == 0
                 model.Add(g2 >= 1 - is_4g[t, s1] - is_4g[t, s2])
                 gaps_2d_vars.append(g2)
-
-            # Slot B -> Slot A: both 3g series (outside holiday wrap) leaves Monday as an off-day
             elif slots[s1]["slot_type"] == "B" and slots[s2]["slot_type"] == "A":
                 if not slots[s1].get("is_monday_holiday_wrap", False) and slots[s2].get("holiday") != "July 4th":
                     g2 = model.NewBoolVar(f"g2_{t}_{k}")
                     model.Add(g2 >= 1 - is_4g[t, s1] - is_4g[t, s2])
                     gaps_2d_vars.append(g2)
 
-    # --------------------------------------------------------------------------
-    # COMPACT TRAVEL MILEAGE PENALTY (1 penalty point per 10 miles)
-    # --------------------------------------------------------------------------
-    travel_10mi_terms = []
-
-    # 1. Travel directly into / out of home venue (linear in x, 0 extra variables)
-    for t in range(n_teams):
-        for sid in away_series_by_team[t]:
-            dest = series_list[sid]["home"]
-            d_10 = dist_matrix[t][dest] // 10
-            if d_10 <= 0:
-                continue
-
-            # If this away series starts a road trip, team travels from home -> dest
-            # If this away series ends a road trip, team travels from dest -> home
-            for k, s in enumerate(active_slots):
-                # Start of season away game
-                if k == 0:
-                    travel_10mi_terms.append(d_10 * x[sid, s])
-                # End of season away game
-                if k == n_active - 1:
-                    travel_10mi_terms.append(d_10 * x[sid, s])
-
-    # 2. Road Trip Leg Transitions (Away -> Away consecutive series)
-    # Only away series can transition to another away series
-    for t in range(n_teams):
-        a_sids = away_series_by_team[t]  # exactly 26 away series
-        for k in range(n_active - 1):
-            s_curr, s_next = active_slots[k], active_slots[k + 1]
-            if (s_next - s_curr) > 1:
-                continue  # Skip All-Star break
-
-            for sid1 in a_sids:
-                h1 = series_list[sid1]["home"]
-                for sid2 in a_sids:
-                    h2 = series_list[sid2]["home"]
-                    if h1 != h2:
-                        d_10 = dist_matrix[h1][h2] // 10
-                        if d_10 > 0:
-                            # Triggers only when playing back-to-back road series
-                            tr = model.NewBoolVar(f"rt_{t}_{k}_{h1}_{h2}")
-                            model.AddBoolAnd([x[sid1, s_curr], x[sid2, s_next]]).OnlyEnforceIf(tr)
-                            travel_10mi_terms.append(d_10 * tr)
-
-    # Fully Aligned Phase 2 Objective
-    # Rebalanced Phase 2 Objective for Geographic & Competitive Balance
-    # Phase 2 Re-calibrated Objective: Divisional Integrity + Regional Travel Swings
+    # Phase 2 Objective with Softened Divisional Spacing & Road Trip / Homestand Caps
     model.Maximize(
         150 * sum(div_early_late_terms)
         - 250 * sum(isolated_home_vars)
         - 400 * sum(isolated_away_vars)
+        - 300 * sum(long_home_vars)
+        - 300 * sum(long_away_vars)
+        - 300 * sum(div_31d_pen_vars)
+        - 300 * sum(div_91d_pen_vars)
         - 50 * sum(road_trip_starts)
         - 1500 * sum(missed_april_vars)
         - 1500 * sum(missed_sept_vars)
@@ -1147,6 +1112,10 @@ def solve_schedule_slots(
         "objective_value": solver.ObjectiveValue(),
         "isolated_homestands": sum(solver.Value(v) for v in isolated_home_vars),
         "isolated_road_trips": sum(solver.Value(v) for v in isolated_away_vars),
+        "long_homestands": sum(solver.Value(v) for v in long_home_vars),
+        "long_road_trips": sum(solver.Value(v) for v in long_away_vars),
+        "div_31d_penalties": sum(solver.Value(v) for v in div_31d_pen_vars),
+        "div_91d_penalties": sum(solver.Value(v) for v in div_91d_pen_vars),
         "early_late_div_series": sum(solver.Value(v) for v in div_early_late_terms),
         "missed_april_pairs": len(missed_apr_pairs),
         "missed_sept_pairs": len(missed_sep_pairs),
@@ -1874,7 +1843,7 @@ def run_validation_checks(
     tz_shifts = compute_timezone_shifts_ge_2h(df, teams)
     print(f"[INFO] League-wide timezone shifts (>= 2 hours): {tz_shifts}")
 
-    # 4. Verify Divisional Spacing Rules
+    # 4. Check Divisional Spacing Rules (Soft Metrics: >2 series in 31d, >3 months apart)
     abbr_to_div = {t["abbr"]: t["division"] for t in teams}
     div_pair_series_dates: Dict[Tuple[str, str], List[Tuple[datetime.date, datetime.date]]] = {}
     for (slot_lbl, h, a), grp in df_temp.groupby(["SeriesSlot", "HomeTeam", "AwayTeam"]):
@@ -1883,15 +1852,24 @@ def run_validation_checks(
             d_list = sorted(grp["DateObj"].tolist())
             div_pair_series_dates.setdefault(pk, []).append((d_list[0], d_list[-1]))
 
+    div_31d_viols = []
+    div_95d_viols = []
     for pk, s_ranges in div_pair_series_dates.items():
         s_ranges.sort(key=lambda r: r[0])
         for i in range(len(s_ranges)):
             in_31 = [r for r in s_ranges if 0 <= (r[0] - s_ranges[i][0]).days <= 30]
-            assert len(in_31) <= 2, f"Divisional pair {pk} has {len(in_31)} series within 31 days: {in_31}"
+            if len(in_31) > 2:
+                div_31d_viols.append(f"{pk[0]}-{pk[1]}")
+                break
         for i in range(len(s_ranges) - 1):
             gap_days = (s_ranges[i + 1][0] - s_ranges[i][1]).days
-            assert gap_days <= 95, f"Divisional pair {pk} has {gap_days} days (>3 months) between series: {s_ranges}"
-    print("[PASS] All divisional pairs play <= 2 series in any 31-day span and never go > 3 months between series")
+            if gap_days > 95:
+                div_95d_viols.append(f"{pk[0]}-{pk[1]} ({gap_days}d)")
+                break
+    print(
+        f"[INFO] Divisional spacing soft metrics: >2 series in 31d={len(div_31d_viols)} {div_31d_viols} | "
+        f">3 months apart={len(div_95d_viols)} {div_95d_viols}"
+    )
 
     # 5. Verify 81 Home / 81 Away games per team
     home_counts = df["HomeTeam"].value_counts().to_dict()
@@ -1982,7 +1960,7 @@ def run_validation_checks(
 
     print("[PASS] All matchup quotas met (52 In-Div; 62 Same-League [6x8 + 7x2]; 48 Interleague [6x1 + 3x14])")
 
-    # 9. Verify Hard Max 3 Road Trip & Homestand Lengths
+    # 9. Check Road Trip & Homestand Lengths (Hard <= 4 series; Soft > 3 series)
     active_slots = [s["slot_idx"] for s in slots if not s["is_asg"]]
     team_slot_ha = {t["abbr"]: {} for t in teams}
     for sid, s in assignment.items():
@@ -1993,6 +1971,8 @@ def run_validation_checks(
         team_slot_ha[a_abbr][s] = "A"
 
     one_series_rt_count = 0
+    long_rt_count = 0
+    long_hs_count = 0
     for t in teams:
         abbr = t["abbr"]
         seq = [team_slot_ha[abbr][s] for s in active_slots]
@@ -2009,12 +1989,19 @@ def run_validation_checks(
         runs.append((curr_char, curr_len))
         for r_type, r_len in runs:
             if r_type == "A":
-                assert 1 <= r_len <= 3, f"Team {abbr} has road trip of {r_len} series (max 3)"
+                assert 1 <= r_len <= 4, f"Team {abbr} has road trip of {r_len} series (hard max 4)"
                 if r_len == 1:
                     one_series_rt_count += 1
+                elif r_len > 3:
+                    long_rt_count += (r_len - 3)
             else:
-                assert 1 <= r_len <= 3, f"Team {abbr} has homestand of {r_len} series (max 3)"
-    print(f"[PASS] All road trips and homestands are <= 3 series (soft 1-series road trips: {one_series_rt_count})")
+                assert 1 <= r_len <= 4, f"Team {abbr} has homestand of {r_len} series (hard max 4)"
+                if r_len > 3:
+                    long_hs_count += (r_len - 3)
+    print(
+        f"[PASS] All road trips and homestands are <= 4 series "
+        f"(Soft >3 series: {long_rt_count}A / {long_hs_count}H | 1-series RT: {one_series_rt_count})"
+    )
 
 # ==============================================================================
 # 6. HISTORICAL / 2026 SCHEDULE AUDIT & OBJECTIVE SCORE EVALUATOR
@@ -2149,6 +2136,8 @@ def evaluate_existing_schedule(
             "early_late_div": 0,
             "iso_h": 0,
             "iso_a": 0,
+            "long_h": 0,
+            "long_a": 0,
             "rt_starts": 0,
             "asg_thu": 0,
             "streak_gt9": 0,
@@ -2224,10 +2213,12 @@ def evaluate_existing_schedule(
                         short_road_trips += 1
                         team_metrics[ab]["iso_a"] += 1
                     elif r_len > 3:
-                        long_road_trips += 1
+                        long_road_trips += (r_len - 3)
+                        team_metrics[ab]["long_a"] += (r_len - 3)
                 else:
                     if r_len > 3:
-                        long_homestands += 1
+                        long_homestands += (r_len - 3)
+                        team_metrics[ab]["long_h"] += (r_len - 3)
 
     season_end = max(df["DateObj"])
     early_cutoff = season_start + datetime.timedelta(days=28)
@@ -2322,18 +2313,17 @@ def evaluate_existing_schedule(
     for t in teams:
         ab = t["abbr"]
         m = team_metrics[ab]
-        # Per-team score in leaderboard:
         score = (
-            100 * m["early_late_div"]
-            - 200 * m["iso_h"]
-            - 450 * m["iso_a"]
+            150 * m["early_late_div"]
+            - 250 * m["iso_h"]
+            - 400 * m["iso_a"]
+            - 300 * (m["long_h"] + m["long_a"])
             - 50 * m["rt_starts"]
             - 150 * m["asg_thu"]
             - 150 * m["streak_gt9"]
             - 100 * (m["mon_off_pen"] + m["thu_off_pen"])
-            - 250 * m["tz_shifts_ge2"]
+            - 350 * m["tz_shifts_ge2"]
             - 100 * m["gaps_2d"]
-            - (m["miles"] // 10)
         )
         team_rows.append({
             "Team": ab,
@@ -2342,6 +2332,7 @@ def evaluate_existing_schedule(
             "EarlyLateDiv": m["early_late_div"],
             "IsoH": m["iso_h"],
             "IsoA": m["iso_a"],
+            "LongH/A": m["long_h"] + m["long_a"],
             "RTStarts": m["rt_starts"],
             ">9dPlay": m["streak_gt9"],
             "TZ>=2h": m["tz_shifts_ge2"],
@@ -2367,6 +2358,10 @@ def evaluate_existing_schedule(
         150 * early_late_div_series
         - 250 * isolated_homestands
         - 400 * short_road_trips
+        - 300 * long_homestands
+        - 300 * long_road_trips
+        - 300 * len(div_31d_violations)
+        - 300 * len(div_3m_violations)
         - 50 * road_trip_starts
         - 1500 * len(missed_apr_list)
         - 1500 * len(missed_sep_list)
@@ -2405,16 +2400,20 @@ def evaluate_existing_schedule(
     print(f" 21. ASG Thursday Games          : {asg_thu_games} games (Soft Penalty)")
     print("-" * 76)
     print("OBJECTIVE FUNCTION SCORE & COMPONENTS:")
-    print(f"  + Early/Late Divisional Series : {early_late_div_series:4d}  (x +100 = {100 * early_late_div_series:+8d})")
+    print(f"  + Early/Late Divisional Series : {early_late_div_series:4d}  (x +150 = {150 * early_late_div_series:+8d})")
     print(f"  - Isolated 1-Series Homestands : {isolated_homestands:4d}  (x -250 = {-250 * isolated_homestands:+8d})")
-    print(f"  - Isolated 1-Series Road Trips : {short_road_trips:4d}  (x -300 = {-300 * short_road_trips:+8d})")
+    print(f"  - Isolated 1-Series Road Trips : {short_road_trips:4d}  (x -400 = {-400 * short_road_trips:+8d})")
+    print(f"  - Long Homestands (>3 series)  : {long_homestands:4d}  (x -300 = {-300 * long_homestands:+8d})")
+    print(f"  - Long Road Trips (>3 series)  : {long_road_trips:4d}  (x -300 = {-300 * long_road_trips:+8d})")
+    print(f"  - Div Pairs >2 Series in 31d   : {len(div_31d_violations):4d}  (x -300 = {-300 * len(div_31d_violations):+8d})")
+    print(f"  - Div Pairs >3 Months Apart    : {len(div_3m_violations):4d}  (x -300 = {-300 * len(div_3m_violations):+8d})")
     print(f"  - Road Trip Initiations        : {road_trip_starts:4d}  (x  -50 = {-50 * road_trip_starts:+8d})")
-    print(f"  - Missed April Div Pairs       : {len(missed_apr_list):4d}  (x -500 = {-500 * len(missed_apr_list):+8d})")
-    print(f"  - Missed Sept Div Pairs        : {len(missed_sep_list):4d}  (x -500 = {-500 * len(missed_sep_list):+8d})")
+    print(f"  - Missed April Div Pairs       : {len(missed_apr_list):4d}  (x-1500 = {-1500 * len(missed_apr_list):+8d})")
+    print(f"  - Missed Sept Div Pairs        : {len(missed_sep_list):4d}  (x-1500 = {-1500 * len(missed_sep_list):+8d})")
     print(f"  - ASG Thursday Games           : {asg_thu_games:4d}  (x -150 = {-150 * asg_thu_games:+8d})")
     print(f"  - Excess Playing Days (>9d)    : {excess_days_over_9:4d}  (x -150 = {-150 * excess_days_over_9:+8d})")
-    print(f"  - Consec M/T Off-Day Weeks     : {total_excess_dow:4d}  (x -200 = {-200 * total_excess_dow:+8d})")
-    print(f"  - Timezone Shifts >= 2 Hours   : {tz_shifts_ge_2h:4d}  (x  -75 = {-75 * tz_shifts_ge_2h:+8d})")
+    print(f"  - Consec M/T Off-Day Weeks     : {total_excess_dow:4d}  (x -100 = {-100 * total_excess_dow:+8d})")
+    print(f"  - Timezone Shifts >= 2 Hours   : {tz_shifts_ge_2h:4d}  (x -350 = {-350 * tz_shifts_ge_2h:+8d})")
     print(f"  - 2-Day Inter-Series Gaps      : {gaps_eq_2_days:4d}  (x -100 = {-100 * gaps_eq_2_days:+8d})")
     print(f"  ==========================================================================")
     print(f"  TOTAL CP-SAT OBJECTIVE SCORE   : {objective_score:,}")
