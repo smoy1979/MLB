@@ -13,6 +13,13 @@ c:; cd 'c:\projects\MLB'; & 'c:\projects\MLB\research311\Scripts\python.exe' 'C:
 c:; cd 'c:\projects\MLB'; & 'c:\projects\MLB\research311\Scripts\python.exe' 'C:\projects\MLB\mlb_scheduler.py' '--evaluate-csv data/mlb_schedule.csv'
 
 
+,
+            "args": [
+                "--evaluate-csv=data/mlb_schedule.csv"
+            ]
+
+
+
 Loaded 2,430 official regular season games for 2026.
 
 ============================================================================

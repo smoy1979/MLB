@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-MLB League-Wide Regular Season Schedule Optimizer, PDF Calendar Generator,
+MLB League-Wide Regular Season Schedule Optimizer, 1-Page Portrait PDF Calendar Generator,
 and Historical Schedule Evaluator using Google OR-Tools CP-SAT.
 
 Usage:
-  1. Optimize 2027 schedule (30-min timeout, exports CSVs + 30 Team PDFs to data/):
-     python mlb_scheduler_7.py
+  1. Optimize 2027 schedule (30-min timeout, exports CSVs + 30 1-Page Team PDFs to data/):
+     python mlb_scheduler_9.py
 
   2. Evaluate official 2026 MLB schedule from MLB Stats API (no optimization):
-     python mlb_scheduler_7.py --evaluate-2026
+     python mlb_scheduler_9.py --evaluate-2026
 
-  3. Evaluate any existing schedule CSV file (and optionally generate PDFs from it):
-     python mlb_scheduler_7.py --evaluate-csv data/mlb_schedule.csv --season-year 2027
+  3. Evaluate any existing schedule CSV file (and generate 1-page PDFs from it):
+     python mlb_scheduler_9.py --evaluate-csv data/mlb_schedule.csv --season-year 2027
 """
 
 import argparse
@@ -24,7 +24,7 @@ import requests
 import pandas as pd
 from ortools.sat.python import cp_model
 
-from reportlab.lib.pagesizes import letter, landscape
+from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.pdfgen import canvas
 
@@ -217,7 +217,6 @@ def build_season_slots(season_year: int = 2027) -> Tuple[List[Dict[str, Any]], D
     curr_mon = start_date + datetime.timedelta(days=4)
     slot_idx = 1
 
-    # Generate all 26 full Monday-Sunday weeks (52 half-week slots: 51 active + 1 ASG Break)
     for wk_offset in range(26):
         tue = curr_mon + datetime.timedelta(days=1)
         wed = curr_mon + datetime.timedelta(days=2)
@@ -249,7 +248,6 @@ def build_season_slots(season_year: int = 2027) -> Tuple[List[Dict[str, Any]], D
                 "is_monday_holiday_wrap": False,
             })
         elif curr_mon in (memorial_day, labor_day):
-            # Previous weekend wrapped into Monday holiday; midweek is strictly Tue-Thu (3g only)
             slots.append({
                 "slot_idx": slot_idx,
                 "label": f"W{week_num:02d}_A",
@@ -337,8 +335,6 @@ def build_season_slots(season_year: int = 2027) -> Tuple[List[Dict[str, Any]], D
                 "is_monday_holiday_wrap": True,
             })
         elif curr_mon in (memorial_day, labor_day):
-            # In a week where Monday was Memorial/Labor Day, Slot A played [Tue, Wed, Thu],
-            # so Slot B is restricted to 3-game series [Fri, Sat, Sun] to prevent Thursday collisions.
             slots.append({
                 "slot_idx": slot_idx,
                 "label": f"W{week_num:02d}_B",
@@ -430,16 +426,13 @@ def solve_matchup_quotas(teams: List[Dict[str, Any]], num_workers: int = 12) -> 
                 s3[i, j] = model.NewIntVar(1, 2, f"s3_{i}_{j}")
                 s4[i, j] = model.NewIntVar(0, 1, f"s4_{i}_{j}")
             elif same_lg:
-                # 1 Home series vs each of the 10 interdivision same-league opponents
                 s3[i, j] = model.NewBoolVar(f"s3_{i}_{j}")
                 s4[i, j] = model.NewBoolVar(f"s4_{i}_{j}")
                 model.Add(s3[i, j] + s4[i, j] == 1)
             elif is_rival:
-                # 6 games vs 1 interleague rival = two 3-game series (1 Home, 1 Away)
                 s3[i, j] = model.NewConstant(1)
                 s4[i, j] = model.NewConstant(0)
             else:
-                # 3 games vs 14 other interleague opponents = one 3-game series per pair
                 s3[i, j] = model.NewBoolVar(f"s3_{i}_{j}")
                 s4[i, j] = model.NewConstant(0)
 
@@ -450,16 +443,13 @@ def solve_matchup_quotas(teams: List[Dict[str, Any]], num_workers: int = 12) -> 
             is_rival = (i, j) in rival_set
 
             if same_div:
-                # 13 games: three 3-game series + one 4-game series (2 Home, 2 Away)
                 model.Add(s3[i, j] + s3[j, i] == 3)
                 model.Add(s4[i, j] + s4[j, i] == 1)
                 model.Add(s3[i, j] + s4[i, j] == 2)
                 model.Add(s3[j, i] + s4[j, i] == 2)
             elif same_lg:
-                # Either 6 games (two 3g) or 7 games (one 3g + one 4g) -> at most one 4g series per pair
                 model.Add(s4[i, j] + s4[j, i] <= 1)
             elif not is_rival:
-                # Exactly one 3-game series between non-rival interleague pairs
                 model.Add(s3[i, j] + s3[j, i] == 1)
 
     for i in range(n):
@@ -467,7 +457,6 @@ def solve_matchup_quotas(teams: List[Dict[str, Any]], num_workers: int = 12) -> 
             j for j in range(n)
             if j != i and teams[j]["league"] == teams[i]["league"] and teams[j]["division"] != teams[i]["division"]
         ]
-        # Interdivision within same league: 6 games x 8 opponents and 7 games x 2 opponents (62 games)
         model.Add(sum(s4[i, j] + s4[j, i] for j in non_div_lg) == 2)
 
         home_games = sum(3 * s3[i, j] + 4 * s4[i, j] for j in range(n) if j != i)
@@ -565,13 +554,7 @@ def solve_schedule_slots(
 ) -> Tuple[Dict[int, int], Dict[str, Any]]:
     """
     Phase 2 CP-SAT Model:
-    Assigns all 780 series to the 52 active half-week slots with:
-      - Hard no-doubleheader constraints (at most one 4-game series per team in any Mon-Sun week).
-      - Hard divisional density cap: at most 2 series vs. the same divisional opponent in any 31-day span.
-      - Hard divisional max-gap cap: never go more than 3 months (91 days) between series vs. the same divisional opponent.
-      - Hard maximum 3 consecutive Home series and maximum 3 consecutive Away series.
-      - Soft penalties for 1-series road trips, 1-series homestands, missed April/September
-        divisional opponents, and All-Star Thursday games.
+    Assigns all 780 series to the 52 active half-week slots.
     """
     print("\nPhase 2: Building CP-SAT slot assignment and road-trip routing model...")
     t0 = time.time()
@@ -586,7 +569,6 @@ def solve_schedule_slots(
     april_slots = [s["slot_idx"] for s in slots if not s["is_asg"] and s["dates_3g"][0] <= april_cutoff]
     sept_slots = [s["slot_idx"] for s in slots if not s["is_asg"] and s["dates_3g"][-1] >= sept_cutoff]
 
-    # Precompute 31-day sliding slot windows and 3-month (91-day) sliding slot windows
     slot_starts = {s["slot_idx"]: s["dates_3g"][0] for s in slots if not s["is_asg"]}
     slot_ends = {s["slot_idx"]: s["dates_3g"][-1] for s in slots if not s["is_asg"]}
 
@@ -619,14 +601,12 @@ def solve_schedule_slots(
         for s in active_slots:
             x[sid, s] = model.NewBoolVar(f"x_{sid}_{s}")
 
-    # 1. Each series scheduled in exactly one active slot
     for sid, sr in enumerate(series_list):
         model.AddExactlyOne(x[sid, s] for s in active_slots)
         for s in active_slots:
             if slots[s].get("force_3g", False) and sr["games"] == 4:
                 model.Add(x[sid, s] == 0)
 
-    # Symmetry breaking for identical series between the same (home, away, games)
     for _, sids in buckets.items():
         if len(sids) > 1:
             for k in range(len(sids) - 1):
@@ -660,8 +640,7 @@ def solve_schedule_slots(
             model.AddExactlyOne(h_vars + a_vars)
             model.Add(sum(h_vars) == is_home[t, k])
 
-    # 1b. HARD NO-DOUBLEHEADER CONSTRAINT:
-    # A team cannot play two 4-game series in the same standard 7-day Mon-Sun week.
+    # Hard No-Doubleheader Constraint
     for s_b in active_slots:
         if slots[s_b].get("shares_thu_with_prev", False):
             s_a = s_b - 1
@@ -671,11 +650,6 @@ def solve_schedule_slots(
                     f4_b = [x[sid, s_b] for sid in four_game_series_by_team[t]]
                     model.Add(sum(f4_a + f4_b) <= 1)
 
-    # 2. Divisional Spacing Constraints:
-    #    - Soft <= April 30 and >= September 1 with penalty slacks
-    #    - Hard: No back-to-back slots against the same divisional opponent
-    #    - Hard: At most 2 series against the same divisional opponent in any 31-day span
-    #    - Hard: Never go more than 3 months (91 days) between series against the same divisional opponent
     missed_april_vars = []
     missed_sept_vars = []
     div_pair_meta = []
@@ -692,41 +666,36 @@ def solve_schedule_slots(
             missed_sept_vars.append(miss_sep)
             div_pair_meta.append((teams[t1]["abbr"], teams[t2]["abbr"], miss_apr, miss_sep))
 
-            # Hard constraint: prevent playing the same divisional opponent in back-to-back slots
+            # Hard: No back-to-back series vs same divisional opponent
             for k in range(n_active - 1):
                 s_curr, s_next = active_slots[k], active_slots[k + 1]
                 model.Add(sum(x[sid, s_curr] + x[sid, s_next] for sid in sids) <= 1)
 
-            # Hard constraint: at most 2 series against the same divisional opponent in any 31-day span
+            # Hard: Max 2 series vs same divisional opponent in any 31-day span
             for win_31 in windows_31d:
                 model.Add(sum(x[sid, s] for sid in sids for s in win_31) <= 2)
 
-            # Hard constraint: at least 1 series in every 3-month (91-day) window so gap is never > 3 months
+            # Hard: At least 1 series in every 3-month (91-day) window
             for win_91 in windows_91d:
                 model.Add(sum(x[sid, s] for sid in sids for s in win_91) >= 1)
 
-    # 3. Road Trip & Homestand Length Constraints (Hard Max 3; Soft Min 2)
     isolated_home_vars = []
     isolated_away_vars = []
 
     for t in range(n_teams):
-        # Hard Max 3 consecutive Home series and Max 3 consecutive Away series
         for k in range(n_active - 3):
             window = [is_home[t, k + d] for d in range(4)]
-            model.Add(sum(window) <= 3)  # Max 3 consecutive Home series
-            model.Add(sum(window) >= 1)  # Max 3 consecutive Away series
+            model.Add(sum(window) <= 3)
+            model.Add(sum(window) >= 1)
 
-        # Soft 1-series road trip at start of season (Away in Slot 0, Home in Slot 1)
         iso_a_start = model.NewBoolVar(f"iso_a_start_{t}")
         model.Add(iso_a_start >= is_home[t, 1] - is_home[t, 0])
         isolated_away_vars.append(iso_a_start)
 
-        # Soft 1-series road trip at end of season (Home in Slot 50, Away in Slot 51)
         iso_a_end = model.NewBoolVar(f"iso_a_end_{t}")
         model.Add(iso_a_end >= is_home[t, n_active - 2] - is_home[t, n_active - 1])
         isolated_away_vars.append(iso_a_end)
 
-        # Interior slots (1 .. n_active - 2): track both A - H - A (1-series homestand) and H - A - H (1-series road trip)
         for k in range(1, n_active - 1):
             iso_h = model.NewBoolVar(f"iso_h_{t}_{k}")
             model.Add(iso_h >= is_home[t, k] - is_home[t, k - 1] - is_home[t, k + 1])
@@ -736,7 +705,6 @@ def solve_schedule_slots(
             model.Add(iso_a >= is_home[t, k - 1] - is_home[t, k] + is_home[t, k + 1] - 1)
             isolated_away_vars.append(iso_a)
 
-    # 4. Soft Penalty for scheduling 4-game series in the post-All-Star Weekend slot
     asg_thursday_4g_vars = []
     post_asg_slots = [s["slot_idx"] for s in slots if s.get("is_post_asg", False)]
     for s_post in post_asg_slots:
@@ -744,7 +712,6 @@ def solve_schedule_slots(
             if sr["games"] == 4:
                 asg_thursday_4g_vars.append(x[sid, s_post])
 
-    # 5. Multi-Objective Formulation
     div_early_late_terms = []
     for sid, sr in enumerate(series_list):
         if sr["is_div"]:
@@ -854,7 +821,7 @@ def optimize_away_leg_ordering(
 
 
 # ==============================================================================
-# 5. CALENDAR EXPANSION, PER-TEAM CSV EXPORT, PDF GENERATOR & VALIDATION
+# 5. CALENDAR EXPANSION, PER-TEAM CSV EXPORT, 1-PAGE PDF GENERATOR & VALIDATION
 # ==============================================================================
 
 def expand_to_daily_schedule(
@@ -975,7 +942,6 @@ def export_schedule_files(
             lambda r: r["AwayTeam"] if r["HomeTeam"] == abbr else r["HomeTeam"], axis=1
         )
 
-        # Calculate idle off-days prior to each game
         date_objs = pd.to_datetime(t_df["Date"]).dt.date.tolist()
         off_days_before = [0]
         for i in range(1, len(date_objs)):
@@ -1012,7 +978,7 @@ def fetch_or_cache_team_logos(
     """
     Attempts to download and cache 500x500 PNG team logos into `data/logos/<ABBR>.png`.
     If offline or unreachable, returns `None` for that team so the PDF generator cleanly
-    renders the `Opponent` abbreviation text instead.
+    renders the Opponent abbreviation text instead.
     """
     logo_map: Dict[str, Optional[str]] = {t["abbr"]: None for t in teams}
     if not enable_logos:
@@ -1038,7 +1004,6 @@ def fetch_or_cache_team_logos(
                     f.write(resp.content)
                 logo_map[abbr] = local_png
         except Exception:
-            # Offline or blocked: gracefully fall back to Opponent text
             break
 
     cached_count = sum(1 for v in logo_map.values() if v is not None)
@@ -1057,23 +1022,37 @@ def generate_team_schedule_pdfs(
     enable_logos: bool = True,
 ) -> None:
     """
-    Generates 30 individual multi-page landscape calendar PDFs (`data/mlb_schedule_<ABBR>.pdf`):
-      - Combines March / April into one calendar page.
-      - Individual pages for May, June, July, and August.
-      - Combines September / October into one calendar page if any regular season games occur in October,
-        otherwise renders September.
-      - Navy blue background (#0A1E3F) for Home games; White background (#FFFFFF) for Road games.
-      - Draws Opponent logo (if cached) or Opponent text in each date cell.
+    Generates 30 individual ONE-PAGE Portrait PDF calendars (`data/mlb_schedule_<ABBR>.pdf`):
+      - 1 single page per team (Letter Portrait: 612 x 792 pt).
+      - 2 columns x 3 rows grid of month blocks (left-to-right, then top-to-bottom):
+          Row 0: March / April (combined) | May
+          Row 1: June                     | July
+          Row 2: August                   | September (or September / October if games in Oct)
+      - White background for all games to provide high contrast for logos.
+      - Extra thick navy blue border (#0A1E3F, 2.2 pt) for Home games; thin border for Road games.
+      - Tuesday All-Star Game (ASG) highlighted with a gold badge; Mon/Wed/Thu ASG Break shaded.
+      - Clean date number in top-left; Opponent logo/text badge in center (no debug subtitle text).
     """
     os.makedirs(output_dir, exist_ok=True)
     logo_map = fetch_or_cache_team_logos(teams, output_dir=output_dir, enable_logos=enable_logos)
 
     navy = colors.HexColor("#0A1E3F")
+    header_blue = colors.HexColor("#1F3A60")
     light_gray = colors.HexColor("#F2F4F7")
     border_gray = colors.HexColor("#CBD2D9")
-    header_blue = colors.HexColor("#1F3A60")
     muted_text = colors.HexColor("#7B8794")
-    dow_names = ["SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"]
+    gold_bg = colors.HexColor("#D97706")       # Rich amber/gold for ASG
+    asg_break_bg = colors.HexColor("#FEF3C7")  # Warm soft cream for ASG Break
+    asg_break_text = colors.HexColor("#92400E")
+    dow_letters = ["S", "M", "T", "W", "T", "F", "S"]
+
+    page_w, page_h = letter  # 612 x 792 pt portrait
+
+    asg_date = datetime.date(season_year, 7, 13)
+    asg_mon = asg_date - datetime.timedelta(days=asg_date.weekday())
+    asg_wed = asg_mon + datetime.timedelta(days=2)
+    asg_thu = asg_mon + datetime.timedelta(days=3)
+    asg_break_days = {asg_mon, asg_wed}
 
     for t in teams:
         abbr = t["abbr"]
@@ -1092,9 +1071,6 @@ def generate_team_schedule_pdfs(
             game_by_date[d] = {
                 "is_home": is_home,
                 "opp": opp,
-                "game_num": int(row.get("SeriesGameNumber", 1)),
-                "total_games": int(row.get("TotalSeriesGames", 3)),
-                "is_day": bool(row.get("IsDayGame", False)),
             }
 
         min_date = min(t_df["DateObj"]) if not t_df.empty else datetime.date(season_year, 3, 25)
@@ -1115,98 +1091,128 @@ def generate_team_schedule_pdfs(
         else:
             periods.append(("SEPTEMBER", datetime.date(season_year, 9, 1), datetime.date(season_year, 9, 30), {9}))
 
-        c = canvas.Canvas(pdf_path, pagesize=landscape(letter))
-        page_w, page_h = landscape(letter)
+        c = canvas.Canvas(pdf_path, pagesize=letter)
 
-        for title, p_start, p_end, active_months in periods:
+        # Top Banner
+        c.setFillColor(navy)
+        c.rect(20, page_h - 44, page_w - 40, 32, fill=1, stroke=0)
+        c.setFillColor(colors.white)
+        c.setFont("Helvetica-Bold", 13)
+        c.drawString(30, page_h - 33, f"{team_name.upper()} ({abbr}) — {season_year} SCHEDULE")
+        c.setFont("Helvetica-Bold", 10)
+        c.drawRightString(page_w - 30, page_h - 33, "REGULAR SEASON CALENDAR")
+
+        # Compact Legend Bar: Thick navy border for Home, Thin border for Road, Gold for ASG
+        legend_y = page_h - 58
+        c.setFillColor(colors.white)
+        c.setStrokeColor(navy)
+        c.setLineWidth(2.2)
+        c.rect(20, legend_y, 11, 11, fill=1, stroke=1)
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(36, legend_y + 2, "HOME (Thick Navy Border)")
+
+        c.setFillColor(colors.white)
+        c.setStrokeColor(border_gray)
+        c.setLineWidth(0.5)
+        c.rect(160, legend_y, 11, 11, fill=1, stroke=1)
+        c.setFillColor(colors.black)
+        c.drawString(176, legend_y + 2, "ROAD (Thin Border)")
+
+        c.setFillColor(gold_bg)
+        c.setStrokeColor(border_gray)
+        c.setLineWidth(0.5)
+        c.rect(265, legend_y, 11, 11, fill=1, stroke=1)
+        c.setFillColor(colors.black)
+        c.drawString(281, legend_y + 2, "ALL-STAR GAME (Gold)")
+
+        # 2 Columns x 3 Rows Geometry (Left-to-right, then top-to-bottom)
+        margin_x = 20.0
+        gap_x = 12.0
+        col_w = (page_w - 2 * margin_x - gap_x) / 2.0  # ~280 pt
+
+        top_y = page_h - 68.0
+        bottom_y = 16.0
+        gap_y = 10.0
+        block_h = (top_y - bottom_y - 2 * gap_y) / 3.0  # ~229 pt
+
+        for idx, (title, p_start, p_end, active_months) in enumerate(periods):
+            col = idx % 2
+            row = idx // 2
+            bx = margin_x + col * (col_w + gap_x)
+            by = top_y - (row + 1) * block_h - row * gap_y
+
+            # Month Block Header
+            title_h = 16.0
+            c.setFillColor(header_blue)
+            c.rect(bx, by + block_h - title_h, col_w, title_h, fill=1, stroke=0)
+            c.setFillColor(colors.white)
+            c.setFont("Helvetica-Bold", 8.5)
+            c.drawCentredString(bx + col_w / 2.0, by + block_h - title_h + 4.5, title)
+
+            # Day-of-week header row (S M T W T F S)
+            dow_h = 13.0
+            c.setFillColor(light_gray)
+            c.rect(bx, by + block_h - title_h - dow_h, col_w, dow_h, fill=1, stroke=0)
+            c.setFillColor(navy)
+            c.setFont("Helvetica-Bold", 7.5)
+            cell_w = col_w / 7.0
+
+            for d_idx, d_char in enumerate(dow_letters):
+                cx = bx + d_idx * cell_w
+                c.drawCentredString(cx + cell_w / 2.0, by + block_h - title_h - dow_h + 3.5, d_char)
+
+            # Weeks & Days Grid
             start_sun = p_start - datetime.timedelta(days=(p_start.weekday() + 1) % 7)
             end_sat = p_end + datetime.timedelta(days=(5 - p_end.weekday()) % 7)
             total_days = (end_sat - start_sun).days + 1
             num_weeks = total_days // 7
-
-            # Top Title Banner
-            c.setFillColor(navy)
-            c.rect(36, page_h - 66, page_w - 72, 36, fill=1, stroke=0)
-            c.setFillColor(colors.white)
-            c.setFont("Helvetica-Bold", 15)
-            c.drawString(48, page_h - 53, f"{team_name.upper()} ({abbr}) — {season_year} REGULAR SEASON SCHEDULE")
-            c.setFont("Helvetica-Bold", 14)
-            c.drawRightString(page_w - 48, page_h - 53, f"{title} {season_year}")
-
-            # Legend Bar
-            c.setFillColor(navy)
-            c.setStrokeColor(border_gray)
-            c.rect(36, page_h - 88, 13, 13, fill=1, stroke=1)
-            c.setFillColor(colors.black)
-            c.setFont("Helvetica-Bold", 9)
-            c.drawString(54, page_h - 85, "HOME GAME (Navy Blue)")
-
-            c.setFillColor(colors.white)
-            c.setStrokeColor(colors.black)
-            c.rect(195, page_h - 88, 13, 13, fill=1, stroke=1)
-            c.setFillColor(colors.black)
-            c.drawString(213, page_h - 85, "ROAD GAME (White)")
-
-            # Calendar Grid Layout
-            grid_left = 36.0
-            grid_right = page_w - 36.0
-            grid_top = page_h - 98.0
-            grid_bottom = 32.0
-            col_w = (grid_right - grid_left) / 7.0
-            header_h = 20.0
-            row_h = (grid_top - grid_bottom - header_h) / float(num_weeks)
-
-            # Day-of-Week Column Headers
-            for col_idx, d_name in enumerate(dow_names):
-                x0 = grid_left + col_idx * col_w
-                c.setFillColor(header_blue)
-                c.setStrokeColor(border_gray)
-                c.rect(x0, grid_top - header_h, col_w, header_h, fill=1, stroke=1)
-                c.setFillColor(colors.white)
-                c.setFont("Helvetica-Bold", 9)
-                c.drawCentredString(x0 + col_w / 2.0, grid_top - header_h + 6, d_name)
+            cell_h = (block_h - title_h - dow_h) / float(num_weeks)
 
             curr_d = start_sun
-            for wk in range(num_weeks):
-                y0 = grid_top - header_h - (wk + 1) * row_h
-                for col_idx in range(7):
-                    x0 = grid_left + col_idx * col_w
+            for w in range(num_weeks):
+                wy = by + block_h - title_h - dow_h - (w + 1) * cell_h
+                for d_idx in range(7):
+                    cx = bx + d_idx * cell_w
                     in_period = (curr_d.month in active_months) and (p_start <= curr_d <= p_end)
                     g_info = game_by_date.get(curr_d) if in_period else None
 
                     if not in_period:
                         c.setFillColor(light_gray)
                         c.setStrokeColor(border_gray)
-                        c.rect(x0, y0, col_w, row_h, fill=1, stroke=1)
+                        c.setLineWidth(0.5)
+                        c.rect(cx, wy, cell_w, cell_h, fill=1, stroke=1)
                     elif g_info is not None:
+                        # White background for ALL games for perfect logo contrast!
+                        c.setFillColor(colors.white)
                         if g_info["is_home"]:
-                            c.setFillColor(navy)
-                            fg_color = colors.white
+                            # Extra thick navy blue border for HOME games
+                            c.setStrokeColor(navy)
+                            c.setLineWidth(2.2)
                         else:
-                            c.setFillColor(colors.white)
-                            fg_color = navy
-                        c.setStrokeColor(border_gray)
-                        c.rect(x0, y0, col_w, row_h, fill=1, stroke=1)
+                            # Thin border for ROAD games
+                            c.setStrokeColor(border_gray)
+                            c.setLineWidth(0.5)
+                        c.rect(cx, wy, cell_w, cell_h, fill=1, stroke=1)
 
-                        # Date number in top-left corner (prefix month abbr on combined pages)
-                        c.setFillColor(fg_color)
-                        c.setFont("Helvetica-Bold", 8.5)
-                        date_label = (
-                            f"{curr_d.strftime('%b')} {curr_d.day}"
-                            if len(active_months) > 1
+                        # Date number in top-left
+                        c.setFillColor(navy if g_info["is_home"] else colors.HexColor("#243B53"))
+                        c.setFont("Helvetica-Bold", 6.5)
+                        date_lbl = (
+                            f"{curr_d.strftime('%b')[:1]}{curr_d.day}"
+                            if len(active_months) > 1 and curr_d.day == 1
                             else str(curr_d.day)
                         )
-                        c.drawString(x0 + 5, y0 + row_h - 12, date_label)
+                        c.drawString(cx + 2.5, wy + cell_h - 7.5, date_lbl)
 
+                        # Clean Opponent badge in center (Logo or Bold Text)
                         opp_abbr = g_info["opp"]
                         logo_file = logo_map.get(opp_abbr)
-                        prefix = "vs" if g_info["is_home"] else "@"
-                        day_tag = " (D)" if g_info["is_day"] else ""
 
                         if logo_file and os.path.exists(logo_file):
-                            img_size = min(col_w * 0.42, row_h * 0.52)
-                            img_x = x0 + (col_w - img_size) / 2.0
-                            img_y = y0 + (row_h - img_size) / 2.0 + 2.0
+                            img_size = min(cell_w * 0.58, cell_h * 0.65)
+                            img_x = cx + (cell_w - img_size) / 2.0
+                            img_y = wy + (cell_h - img_size) / 2.0 - 1.5
                             try:
                                 c.drawImage(
                                     logo_file,
@@ -1218,39 +1224,60 @@ def generate_team_schedule_pdfs(
                                     preserveAspectRatio=True,
                                 )
                             except Exception:
-                                c.setFont("Helvetica-Bold", 14)
-                                c.drawCentredString(x0 + col_w / 2.0, y0 + row_h / 2.0 - 4, opp_abbr)
+                                c.setFillColor(navy)
+                                c.setFont("Helvetica-Bold", 8.5)
+                                c.drawCentredString(cx + cell_w / 2.0, wy + cell_h / 2.0 - 4.0, opp_abbr)
                         else:
-                            c.setFont("Helvetica-Bold", 15)
-                            c.drawCentredString(x0 + col_w / 2.0, y0 + row_h / 2.0 - 4, opp_abbr)
+                            c.setFillColor(navy)
+                            c.setFont("Helvetica-Bold", 8.5)
+                            c.drawCentredString(cx + cell_w / 2.0, wy + cell_h / 2.0 - 4.0, opp_abbr)
+                    elif curr_d == asg_date:
+                        # All-Star Game Tuesday: highlighted in rich gold with ASG badge
+                        c.setFillColor(gold_bg)
+                        c.setStrokeColor(border_gray)
+                        c.setLineWidth(0.5)
+                        c.rect(cx, wy, cell_w, cell_h, fill=1, stroke=1)
 
-                        c.setFont("Helvetica", 7.5)
-                        c.drawCentredString(
-                            x0 + col_w / 2.0,
-                            y0 + 5,
-                            f"{prefix} {opp_abbr}",
-                        )
+                        c.setFillColor(colors.white)
+                        c.setFont("Helvetica-Bold", 6.5)
+                        c.drawString(cx + 2.5, wy + cell_h - 7.5, str(curr_d.day))
+
+                        c.setFont("Helvetica-Bold", 8.0)
+                        c.drawCentredString(cx + cell_w / 2.0, wy + cell_h / 2.0 - 3.5, "ASG")
+                    elif curr_d in asg_break_days or (curr_d == asg_thu and g_info is None):
+                        # Core All-Star Break days: soft warm cream with Break label
+                        c.setFillColor(asg_break_bg)
+                        c.setStrokeColor(border_gray)
+                        c.setLineWidth(0.5)
+                        c.rect(cx, wy, cell_w, cell_h, fill=1, stroke=1)
+
+                        c.setFillColor(asg_break_text)
+                        c.setFont("Helvetica-Bold", 6.5)
+                        c.drawString(cx + 2.5, wy + cell_h - 7.5, str(curr_d.day))
+
+                        c.setFont("Helvetica-Bold", 6.0)
+                        c.drawCentredString(cx + cell_w / 2.0, wy + cell_h / 2.0 - 2.5, "BREAK")
                     else:
-                        # Scheduled Off-Day inside active month
+                        # Standard Scheduled Off-Day
                         c.setFillColor(colors.white)
                         c.setStrokeColor(border_gray)
-                        c.rect(x0, y0, col_w, row_h, fill=1, stroke=1)
+                        c.setLineWidth(0.5)
+                        c.rect(cx, wy, cell_w, cell_h, fill=1, stroke=1)
                         c.setFillColor(muted_text)
-                        c.setFont("Helvetica", 8.5)
-                        date_label = (
-                            f"{curr_d.strftime('%b')} {curr_d.day}"
-                            if len(active_months) > 1
+                        c.setFont("Helvetica", 6.5)
+                        date_lbl = (
+                            f"{curr_d.strftime('%b')[:1]}{curr_d.day}"
+                            if len(active_months) > 1 and curr_d.day == 1
                             else str(curr_d.day)
                         )
-                        c.drawString(x0 + 5, y0 + row_h - 12, date_label)
+                        c.drawString(cx + 2.5, wy + cell_h - 7.5, date_lbl)
 
                     curr_d += datetime.timedelta(days=1)
 
-            c.showPage()
-
+        c.showPage()
         c.save()
 
-    print(f"Generated 30 team schedule PDFs in '{output_dir}/mlb_schedule_<TEAM>.pdf'.")
+    print(f"Generated 30 1-page team schedule PDFs in '{output_dir}/mlb_schedule_<TEAM>.pdf'.")
 
 
 def run_validation_checks(
@@ -1305,7 +1332,7 @@ def run_validation_checks(
         s_list = t_df["SeriesSlot"].tolist()
         for i in range(1, len(d_list)):
             if s_list[i] == s_list[i - 1]:
-                continue  # Same series
+                continue
             if d_list[i - 1] < asg_mon and d_list[i] >= asg_mon and d_list[i] <= asg_fri:
                 continue
             idle_days = (d_list[i] - d_list[i - 1]).days - 1
@@ -1320,7 +1347,7 @@ def run_validation_checks(
         f"(2-off-day gaps league-wide: {len(two_day_gaps)})"
     )
 
-    # 4. Verify Divisional Spacing Rules (<= 2 series in any 31-day span, and <= 91 days between consecutive series)
+    # 4. Verify Divisional Spacing Rules (<= 2 series in any 31-day span, and <= 95 days between consecutive series)
     abbr_to_div = {t["abbr"]: t["division"] for t in teams}
     div_pair_series_dates: Dict[Tuple[str, str], List[Tuple[datetime.date, datetime.date]]] = {}
     for (slot_lbl, h, a), grp in df_temp.groupby(["SeriesSlot", "HomeTeam", "AwayTeam"]):
@@ -1331,11 +1358,9 @@ def run_validation_checks(
 
     for pk, s_ranges in div_pair_series_dates.items():
         s_ranges.sort(key=lambda r: r[0])
-        # Check max 2 series in any 31-day window
         for i in range(len(s_ranges)):
             in_31 = [r for r in s_ranges if 0 <= (r[0] - s_ranges[i][0]).days <= 30]
             assert len(in_31) <= 2, f"Divisional pair {pk} has {len(in_31)} series within 31 days: {in_31}"
-        # Check max 3 months (~95 days end-to-start) between consecutive series
         for i in range(len(s_ranges) - 1):
             gap_days = (s_ranges[i + 1][0] - s_ranges[i][1]).days
             assert gap_days <= 95, f"Divisional pair {pk} has {gap_days} days (>3 months) between series: {s_ranges}"
@@ -1531,7 +1556,6 @@ def evaluate_existing_schedule(
     abbr_to_idx = {t["abbr"]: i for i, t in enumerate(teams)}
     abbr_to_div = {t["abbr"]: t["division"] for t in teams}
 
-    # 1. Total games & per-team H/A balance
     total_games = len(df)
     home_counts = df["HomeTeam"].value_counts().to_dict()
     away_counts = df["AwayTeam"].value_counts().to_dict()
@@ -1542,7 +1566,6 @@ def evaluate_existing_schedule(
         if h_c != 81 or a_c != 81:
             imbalanced_teams.append(f"{ab} ({h_c}H/{a_c}A)")
 
-    # 2. Check Doubleheaders
     team_dates = pd.concat([
         df[["Date", "HomeTeam"]].rename(columns={"HomeTeam": "Team"}),
         df[["Date", "AwayTeam"]].rename(columns={"AwayTeam": "Team"}),
@@ -1550,7 +1573,6 @@ def evaluate_existing_schedule(
     dup_rows = team_dates[team_dates.duplicated(subset=["Date", "Team"], keep=False)]
     num_doubleheaders = len(dup_rows) // 2
 
-    # 3. Reconstruct series per team-pair
     df_sorted = df.sort_values(by=["DateObj", "HomeTeam", "AwayTeam"]).reset_index(drop=True)
     active_series: Dict[Tuple[str, str], Dict[str, Any]] = {}
     reconstructed_series: List[Dict[str, Any]] = []
@@ -1583,7 +1605,6 @@ def evaluate_existing_schedule(
             if any(diff > 1 for diff in diffs):
                 internal_gap_series.append((sr["home"], sr["away"], [str(dt) for dt in sr["dates"]]))
 
-    # 4. Build per-team chronological series sequence & check inter-series off-day gaps
     team_series_seq: Dict[str, List[Dict[str, Any]]] = {t["abbr"]: [] for t in teams}
     for sr in reconstructed_series:
         team_series_seq[sr["home"]].append({"type": "H", "venue": sr["home"], "opp": sr["away"], "start": sr["dates"][0], "end": sr["dates"][-1], "games": len(sr["dates"])})
@@ -1650,7 +1671,6 @@ def evaluate_existing_schedule(
                     if r_len > 3:
                         long_homestands += 1
 
-    # 5. Check Divisional Spacing (Apr/Sep, <=2 in 31 days, <=3 months between series)
     season_end = max(df["DateObj"])
     early_cutoff = season_start + datetime.timedelta(days=28)
     late_cutoff = season_end - datetime.timedelta(days=28)
@@ -1699,13 +1719,11 @@ def evaluate_existing_schedule(
     missed_apr_list = [f"{k[0]}-{k[1]}" for k, v in div_pair_apr.items() if v == 0]
     missed_sep_list = [f"{k[0]}-{k[1]}" for k, v in div_pair_sep.items() if v == 0]
 
-    # 6. Check All-Star Break
     asg_wed = asg_mon + datetime.timedelta(days=2)
     asg_thu = asg_mon + datetime.timedelta(days=3)
     asg_core_games = len(df[(df["DateObj"] >= asg_mon) & (df["DateObj"] <= asg_wed)])
     asg_thu_games = len(df[df["DateObj"] == asg_thu])
 
-    # 7. Calculate Objective Score using our Phase 2 formula
     objective_score = (
         100 * early_late_div_series
         - 250 * isolated_homestands
@@ -1842,12 +1860,12 @@ def main(
     print("\nBottom 3 Teams by Travel Distance:")
     for abbr, miles in sorted_miles[-3:]:
         print(f"  - {abbr}: {miles:,} miles")
-    print(f"\nExported {len(df):,} game rows to '{master_csv}' (+ 30 CSVs & 30 PDFs in '{output_dir}/').")
+    print(f"\nExported {len(df):,} game rows to '{master_csv}' (+ 30 CSVs & 30 1-Page PDFs in '{output_dir}/').")
     print("=" * 72)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MLB CP-SAT Schedule Optimizer & PDF Generator")
+    parser = argparse.ArgumentParser(description="MLB CP-SAT Schedule Optimizer & 1-Page PDF Generator")
     parser.add_argument("--season-year", type=int, default=2027, help="Target season year (default: 2027)")
     parser.add_argument("--timeout", type=int, default=1800, help="Phase 2 solver timeout in seconds (default: 1800)")
     parser.add_argument("--workers", type=int, default=12, help="Number of CP-SAT search workers (default: 12)")
