@@ -25,7 +25,8 @@
                 "PYTHONPATH": "${workspaceFolder}",
             },
             "args": [
-                "--evaluate-year=2027"
+                "--evaluate-year=2027",
+                "--profile=mlb_mimic"
             ]
         }
     ]
