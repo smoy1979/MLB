@@ -45,7 +45,7 @@ class ScheduleConfig:
     max_homestand_roadtrip_hard: int = 4
     enforce_no_b2b_div_hard: bool = True
     force_no_asg_thursday_hard: bool = False
-    max_isolated_series_per_team: int = 2
+    max_isolated_series_per_team: int = 0
 
     # --- Soft Objective Weights ---
     w_early_late_div: int = 150
@@ -64,7 +64,7 @@ class ScheduleConfig:
     w_tz_shift_ge2: int = -250
     w_tz_abs_hour: int = -125
     w_gap_2d: int = -100
-    w_regional_road_pair: int = 150   # Bonus per road trip pairing host venues <= 450 mi
+    w_geo_manhattan: int = -5         # Penalty per 0.1-deg (~5.5 mi) lat/lon travel step
 
 
 def get_schedule_config(profile: str = "custom") -> ScheduleConfig:
@@ -72,30 +72,30 @@ def get_schedule_config(profile: str = "custom") -> ScheduleConfig:
     if profile == "mlb_mimic":
         return ScheduleConfig(
             name="mlb_mimic",
-            max_consec_play_days_hard=20,     # MLB CBA Article V limit
-            soft_streak_threshold=14,         # Only penalize streaks longer than 2 full weeks
-            max_homestand_roadtrip_hard=4,    # Hard max 4 (avoids over-constraining during search)
-            enforce_no_b2b_div_hard=False,    # MLB allows back-to-back division series
-            force_no_asg_thursday_hard=False, # Use soft penalty (-2000) rather than hard block
-            max_isolated_series_per_team=0,   # Let the soft weights (-650/-850) minimize single series
+            max_consec_play_days_hard=16,     # Official schedule has 0 streaks >= 17 days
+            soft_streak_threshold=9,          # Evaluate >9d streaks directly like the audit table
+            max_homestand_roadtrip_hard=3,    # Official schedule has LongH/A = 1 (strictly <= 3)
+            enforce_no_b2b_div_hard=True,     # Official schedule has 0 back-to-back same-div series
+            force_no_asg_thursday_hard=True,  # Official schedule has 0 ASG Thursday games
+            max_isolated_series_per_team=0,   # Use strong soft weights below (avoids solver lockup)
 
-            w_early_late_div=0,
-            w_isolated_home=-650,
-            w_isolated_away=-850,
-            w_long_home=-800,                 # Heavily penalizes 4-series stands without locking solver
-            w_long_away=-800,                 # Heavily penalizes 4-series trips without locking solver
-            w_road_trip_start=-120,
-            w_missed_april_div=0,
-            w_missed_sept_div=-200,
+            w_early_late_div=50,              # Mild bonus to match official ~204 early/late div series
+            w_isolated_home=-1100,            # Strong penalty to drive IsoH from 123 down toward ~53
+            w_isolated_away=-1300,            # Strong penalty to drive IsoA from 126 down toward ~55
+            w_long_home=0,                    # Hard-capped at 3
+            w_long_away=0,                    # Hard-capped at 3
+            w_road_trip_start=-150,           # Favor 2-3 series road swings
+            w_missed_april_div=-400,
+            w_missed_sept_div=-400,
             w_div_31d_excess=0,
             w_div_91d_gap=0,
-            w_asg_thursday_game=-2500,        # High soft penalty achieves 0 without search deadlocks
-            w_streak_over_threshold=-40,
-            w_consec_dow_off=-75,
-            w_tz_shift_ge2=-750,
-            w_tz_abs_hour=-300,
-            w_gap_2d=0,
-            w_regional_road_pair=250,
+            w_asg_thursday_game=-2500,
+            w_streak_over_threshold=-120,     # Keeps >9dPlay right around ~530
+            w_consec_dow_off=-100,
+            w_tz_shift_ge2=-500,
+            w_tz_abs_hour=-200,
+            w_gap_2d=-50,
+            w_geo_manhattan=-12,              # Direct 2D lat/lon mileage minimization (~2.2 pts/mile)
         )
     return ScheduleConfig(name="custom")
 
@@ -1132,27 +1132,42 @@ def solve_schedule_slots(
             tz_shifts_ge2_vars.append(tz_ge2)
 
     # --------------------------------------------------------------------------
-    # ROAD TRIP REGIONAL PAIRING BONUS (Host venues <= 450 miles apart)
+    # LINEAR 2D GEOGRAPHIC DISTANCE (0.1-degree Lat/Lon Manhattan steps)
     # --------------------------------------------------------------------------
-    regional_road_pairs = []
-    if cfg.w_regional_road_pair != 0:
+    # 0.1 deg lat ~= 6.9 miles; 0.1 deg lon at 38N ~= 5.4 miles.
+    # Requires only 2 integer variables per team-slot transition (3,000 vars total)
+    # and gives CP-SAT a tight linear relaxation of true 2D mileage!
+    venue_lat_10 = [int(round(teams[h]["lat"] * 10)) for h in range(n_teams)]
+    venue_lon_10 = [int(round(teams[h]["lon"] * 0.788 * 10)) for h in range(n_teams)]
+
+    min_lat, max_lat = min(venue_lat_10), max(venue_lat_10)
+    min_lon, max_lon = min(venue_lon_10), max(venue_lon_10)
+    max_dlat = max_lat - min_lat
+    max_dlon = max_lon - min_lon
+
+    geo_manhattan_vars = []
+    if cfg.w_geo_manhattan != 0:
         for t in range(n_teams):
-            a_sids = away_series_by_team[t]
+            t_sids = home_series_by_team[t] + away_series_by_team[t]
             for k in range(n_active - 1):
                 s_curr, s_next = active_slots[k], active_slots[k + 1]
                 if (s_next - s_curr) > 1:
                     continue  # Skip All-Star Break
 
-                for sid1 in a_sids:
-                    h1 = series_list[sid1]["home"]
-                    for sid2 in a_sids:
-                        h2 = series_list[sid2]["home"]
-                        if h1 != h2 and dist_matrix[h1][h2] <= 450:
-                            c_var = model.NewBoolVar(f"cl_{t}_{k}_{sid1}_{sid2}")
-                            # Standard upper-bounding for maximization:
-                            model.Add(c_var <= x[sid1, s_curr])
-                            model.Add(c_var <= x[sid2, s_next])
-                            regional_road_pairs.append(c_var)
+                lat_curr = sum(venue_lat_10[series_list[sid]["home"]] * x[sid, s_curr] for sid in t_sids)
+                lat_next = sum(venue_lat_10[series_list[sid]["home"]] * x[sid, s_next] for sid in t_sids)
+                lon_curr = sum(venue_lon_10[series_list[sid]["home"]] * x[sid, s_curr] for sid in t_sids)
+                lon_next = sum(venue_lon_10[series_list[sid]["home"]] * x[sid, s_next] for sid in t_sids)
+
+                dlat = model.NewIntVar(0, max_dlat, f"dlat_{t}_{k}")
+                dlon = model.NewIntVar(0, max_dlon, f"dlon_{t}_{k}")
+                model.Add(dlat >= lat_next - lat_curr)
+                model.Add(dlat >= lat_curr - lat_next)
+                model.Add(dlon >= lon_next - lon_curr)
+                model.Add(dlon >= lon_curr - lon_next)
+
+                geo_manhattan_vars.append(dlat)
+                geo_manhattan_vars.append(dlon)
 
     # --------------------------------------------------------------------------
     # 2-DAY OFF-DAY GAPS (Inter-series gaps == 2 days)
@@ -1192,7 +1207,7 @@ def solve_schedule_slots(
         + cfg.w_tz_shift_ge2 * sum(tz_shifts_ge2_vars)
         + cfg.w_tz_abs_hour * sum(tz_abs_vars)
         + cfg.w_gap_2d * sum(gaps_2d_vars)
-        + cfg.w_regional_road_pair * sum(regional_road_pairs)
+        + cfg.w_geo_manhattan * sum(geo_manhattan_vars)
     )
 
     solver = cp_model.CpSolver()
@@ -1256,7 +1271,7 @@ def solve_schedule_slots(
         "tz_shifts_ge2": sum(solver.Value(v) for v in tz_shifts_ge2_vars),
         "tz_abs_hours": sum(solver.Value(v) for v in tz_abs_vars),
         "gaps_2d": sum(solver.Value(v) for v in gaps_2d_vars),
-        "clust_rt_pairs": sum(solver.Value(v) for v in regional_road_pairs),
+        "geo_manhattan_steps": sum(solver.Value(v) for v in geo_manhattan_vars),
     }
     return assignment, metrics
 
@@ -2566,7 +2581,6 @@ def evaluate_existing_schedule(
             + cfg.w_tz_shift_ge2 * m["tz_shifts_ge2"]
             + cfg.w_tz_abs_hour * m["tz_abs"]
             + cfg.w_gap_2d * m["gaps_2d"]
-            + cfg.w_regional_road_pair * m["clust_rt"]
         )
         team_rows.append({
             "Team": ab,
@@ -2618,7 +2632,6 @@ def evaluate_existing_schedule(
         + cfg.w_tz_shift_ge2 * tz_shifts_ge_2h
         + cfg.w_tz_abs_hour * total_tz_abs
         + cfg.w_gap_2d * gaps_eq_2_days
-        + cfg.w_regional_road_pair * total_clust_rt
     )
 
     print("\n" + "=" * 76)
@@ -2664,7 +2677,6 @@ def evaluate_existing_schedule(
     print(f"  - Consec M/T Off-Day Weeks     : {total_excess_dow:4d}  (x {cfg.w_consec_dow_off:+5d} = {cfg.w_consec_dow_off * total_excess_dow:+8d})")
     print(f"  - Timezone Shifts >= 2 Hours   : {tz_shifts_ge_2h:4d}  (x {cfg.w_tz_shift_ge2:+5d} = {cfg.w_tz_shift_ge2 * tz_shifts_ge_2h:+8d})")
     print(f"  - 2-Day Inter-Series Gaps      : {gaps_eq_2_days:4d}  (x {cfg.w_gap_2d:+5d} = {cfg.w_gap_2d * gaps_eq_2_days:+8d})")
-    print(f"  + Regional Road Trip Pairs     : {total_clust_rt:4d}  (x {cfg.w_regional_road_pair:+5d} = {cfg.w_regional_road_pair * total_clust_rt:+8d})")
     print(f"  ==========================================================================")
     print(f"  TOTAL CP-SAT OBJECTIVE SCORE   : {objective_score:,}")
     print("-" * 76)
