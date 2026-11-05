@@ -28,6 +28,21 @@
                 "--evaluate-year=2027",
                 "--profile=mlb_mimic"
             ]
+        },
+        {
+            "name": "mlb_mimic mode",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "mlb_scheduler.py",
+            "console": "integratedTerminal",
+            "env": {
+                "PYDEVD_WARN_EVALUATION_TIMEOUT": "300000",
+                "PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "3",
+                "PYTHONPATH": "${workspaceFolder}",
+            },
+            "args": [
+                "--profile=mlb_mimic"
+            ]
         }
     ]
 }
