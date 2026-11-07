@@ -45,7 +45,7 @@ class ScheduleConfig:
     max_homestand_roadtrip_hard: int = 4
     enforce_no_b2b_div_hard: bool = True
     force_no_asg_thursday_hard: bool = False
-    max_isolated_series_per_team: int = 2
+    max_isolated_series_per_team: int = 0
 
     # --- Soft Objective Weights ---
     w_early_late_div: int = 150
@@ -64,7 +64,7 @@ class ScheduleConfig:
     w_tz_shift_ge2: int = -250
     w_tz_abs_hour: int = -125
     w_gap_2d: int = -100
-    w_regional_road_pair: int = 150   # Bonus per road trip pairing host venues <= 350 mi
+    w_regional_road_pair: int = 0
 
 
 def get_schedule_config(profile: str = "custom") -> ScheduleConfig:
@@ -258,18 +258,20 @@ def optimize_away_leg_ordering(
     assignment: Dict[int, int],
     dist_matrix: List[List[int]],
     season_year: int = 2027,
+    num_workers: int = 12,
+    cfg: ScheduleConfig = ScheduleConfig(),
 ) -> Dict[int, int]:
     """
-    Post-optimization TSP optimizer:
-    Identifies multi-series road trips for each team and evaluates valid slot permutations
-    of those away series to minimize sequential venue-to-venue Haversine travel distance,
-    without altering home dates, series lengths, or rest constraints.
+    Phase 3 Post-Optimization Sliding-Window LNS Polish:
+    Slides a 10-slot window across the 52 active slots. Within each window, unlocks the
+    ~150 series assigned to those slots and uses CP-SAT (warm-started with the incumbent
+    solution) to directly minimize exact Haversine travel miles, isolated 1-series stands,
+    and timezone jumps while respecting all hard constraints.
     """
     n_teams = len(teams)
     active_slots = [s["slot_idx"] for s in slots if not s["is_asg"]]
-    slot_to_series = {s: [] for s in active_slots}
-    for sid, s in assignment.items():
-        slot_to_series[s].append(sid)
+    n_active = len(active_slots)
+    venue_tz_val = [abs(TEAM_TIMEZONES.get(teams[h]["abbr"], 0)) for h in range(n_teams)]
 
     def compute_total_miles(assign_map: Dict[int, int]) -> int:
         slot_to_venue = {t: {} for t in range(n_teams)}
@@ -285,96 +287,213 @@ def optimize_away_leg_ordering(
                 curr_v = slot_to_venue[t][s]
                 total += dist_matrix[prev_v][curr_v]
                 prev_v = curr_v
-            total += dist_matrix[prev_v][t]  # return home
+            total += dist_matrix[prev_v][t]
         return total
 
     initial_miles = compute_total_miles(assignment)
-    print(f"\nPost-processing travel routing (Initial league travel: {initial_miles:,} miles)...")
+    print(f"\nPhase 3: Sliding-Window Exact Mileage & Cadence Polish (Initial travel: {initial_miles:,} miles)...")
 
-    improved_assignment = dict(assignment)
+    curr_assign = dict(assignment)
+    win_size = 10
+    step_size = 5
+    max_ha = cfg.max_homestand_roadtrip_hard if cfg.max_homestand_roadtrip_hard > 0 else 4
 
-    # For each team, identify consecutive road series runs (length 2 or 3)
-    team_away_slots: Dict[int, List[int]] = {t: [] for t in range(n_teams)}
-    for sid, s in improved_assignment.items():
-        a = series_list[sid]["away"]
-        team_away_slots[a].append(s)
+    # Two passes of sliding windows across the 52 active slots
+    window_starts = list(range(0, n_active - win_size + 1, step_size))
+    if window_starts[-1] != n_active - win_size:
+        window_starts.append(n_active - win_size)
 
-    swaps_made = 0
-    for t in range(n_teams):
-        a_slots = sorted(team_away_slots[t])
-        # Find runs of consecutive active slots where team t is away
-        runs = []
-        curr_run = []
-        for s in a_slots:
-            if not curr_run or active_slots.index(s) == active_slots.index(curr_run[-1]) + 1:
-                curr_run.append(s)
-            else:
-                if len(curr_run) in (2, 3):
-                    runs.append(list(curr_run))
-                curr_run = [s]
-        if len(curr_run) in (2, 3):
-            runs.append(list(curr_run))
+    for pass_num in range(1, 3):
+        for w_start in window_starts:
+            w_end = w_start + win_size  # indices in active_slots: [w_start .. w_end - 1]
+            win_k_list = list(range(w_start, w_end))
+            win_slots = [active_slots[k] for k in win_k_list]
+            win_slot_set = set(win_slots)
 
-        for run in runs:
-            # Series played by team t in this road trip
-            run_sids = [sid for s in run for sid in slot_to_series[s] if series_list[sid]["away"] == t]
-            if len(run_sids) != len(run):
-                continue
+            # Series currently inside this window
+            win_sids = [sid for sid, s in curr_assign.items() if s in win_slot_set]
 
-            # Prior venue (before road trip) and next venue (after road trip)
-            k_first = active_slots.index(run[0])
-            k_last = active_slots.index(run[-1])
-            prev_v = t if k_first == 0 else [
-                series_list[sid]["home"] for sid in slot_to_series[active_slots[k_first - 1]]
-                if series_list[sid]["home"] == t or series_list[sid]["away"] == t
-            ][0]
-            next_v = t if k_last == len(active_slots) - 1 else [
-                series_list[sid]["home"] for sid in slot_to_series[active_slots[k_last + 1]]
-                if series_list[sid]["home"] == t or series_list[sid]["away"] == t
-            ][0]
+            # Precompute fixed venue & home/away state for all slots outside the window
+            fixed_venue = {t: {} for t in range(n_teams)}
+            fixed_home = {t: {} for t in range(n_teams)}
+            fixed_4g = {t: {} for t in range(n_teams)}
+            for t in range(n_teams):
+                for s in active_slots:
+                    if s not in win_slot_set:
+                        fixed_4g[t][s] = 0
 
-            best_order = run_sids
-            best_cost = None
+            for sid, s in curr_assign.items():
+                if s not in win_slot_set:
+                    sr = series_list[sid]
+                    h, a = sr["home"], sr["away"]
+                    fixed_venue[h][s] = h
+                    fixed_venue[a][s] = h
+                    fixed_home[h][s] = 1
+                    fixed_home[a][s] = 0
+                    if sr["games"] == 4:
+                        fixed_4g[h][s] = 1
+                        fixed_4g[a][s] = 1
 
-            for perm in itertools.permutations(run_sids):
-                # Verify 4-game / 3-game compatibility with slots in run
-                valid = True
-                for slot_idx, cand_sid in zip(run, perm):
-                    cand_sr = series_list[cand_sid]
-                    if slots[slot_idx].get("force_3g", False) and cand_sr["games"] == 4:
-                        valid = False
-                        break
-                    # Verify opponent does not have a conflict in that slot
-                    opp = cand_sr["home"]
-                    opp_sids_in_slot = [sid for sid in slot_to_series[slot_idx] if sid != cand_sid]
-                    if any(series_list[sid]["home"] == opp or series_list[sid]["away"] == opp for sid in opp_sids_in_slot):
-                        valid = False
-                        break
-                if not valid:
-                    continue
+            sub = cp_model.CpModel()
+            wx = {}
+            for sid in win_sids:
+                sr = series_list[sid]
+                for s in win_slots:
+                    wx[sid, s] = sub.NewBoolVar(f"wx_{sid}_{s}")
+                    if slots[s].get("force_3g", False) and sr["games"] == 4:
+                        sub.Add(wx[sid, s] == 0)
+                    if cfg.force_no_asg_thursday_hard and slots[s].get("is_post_asg", False) and sr["games"] == 4:
+                        sub.Add(wx[sid, s] == 0)
+                    # Warm-start hint with current incumbent assignment
+                    sub.AddHint(wx[sid, s], 1 if curr_assign[sid] == s else 0)
+                sub.AddExactlyOne(wx[sid, s] for s in win_slots)
 
-                # Compute distance for this candidate ordering: prev_v -> h1 -> h2 (-> h3) -> next_v
-                venues = [series_list[sid]["home"] for sid in perm]
-                cost = dist_matrix[prev_v][venues[0]]
-                for i in range(len(venues) - 1):
-                    cost += dist_matrix[venues[i]][venues[i + 1]]
-                cost += dist_matrix[venues[-1]][next_v]
+            team_win_home_sids = {t: [] for t in range(n_teams)}
+            team_win_away_sids = {t: [] for t in range(n_teams)}
+            team_win_4g_sids = {t: [] for t in range(n_teams)}
+            for sid in win_sids:
+                sr = series_list[sid]
+                team_win_home_sids[sr["home"]].append(sid)
+                team_win_away_sids[sr["away"]].append(sid)
+                if sr["games"] == 4:
+                    team_win_4g_sids[sr["home"]].append(sid)
+                    team_win_4g_sids[sr["away"]].append(sid)
 
-                if best_cost is None or cost < best_cost:
-                    best_cost = cost
-                    best_order = perm
+            w_is_home = {}
+            w_is_4g = {}
+            for t in range(n_teams):
+                for k in range(n_active):
+                    s = active_slots[k]
+                    if s in win_slot_set:
+                        ih = sub.NewBoolVar(f"wih_{t}_{k}")
+                        h_list = [wx[sid, s] for sid in team_win_home_sids[t]]
+                        a_list = [wx[sid, s] for sid in team_win_away_sids[t]]
+                        sub.AddExactlyOne(h_list + a_list)
+                        sub.Add(sum(h_list) == ih)
+                        w_is_home[t, k] = ih
 
-            if best_order != run_sids:
-                # Apply the swap
-                for slot_idx, new_sid, old_sid in zip(run, best_order, run_sids):
-                    improved_assignment[new_sid] = slot_idx
-                    slot_to_series[slot_idx].remove(old_sid)
-                    slot_to_series[slot_idx].append(new_sid)
-                swaps_made += 1
+                        f4_list = [wx[sid, s] for sid in team_win_4g_sids[t]]
+                        if slots[s].get("force_3g", False) or not f4_list:
+                            w_is_4g[t, s] = 0
+                        else:
+                            b4 = sub.NewBoolVar(f"w4g_{t}_{s}")
+                            sub.Add(sum(f4_list) == b4)
+                            w_is_4g[t, s] = b4
+                    else:
+                        w_is_home[t, k] = fixed_home[t][s]
+                        w_is_4g[t, s] = fixed_4g[t][s]
 
-    final_miles = compute_total_miles(improved_assignment)
-    print(f"Post-processing complete: Made {swaps_made} road-trip route swaps. New total travel: {final_miles:,} miles.")
-    return improved_assignment
+            # Hard No-Doubleheader across window + boundary
+            for s_b in active_slots:
+                if slots[s_b].get("shares_thu_with_prev", False):
+                    s_a = s_b - 1
+                    if s_a in active_slots and (s_a in win_slot_set or s_b in win_slot_set):
+                        for t in range(n_teams):
+                            sub.Add(w_is_4g[t, s_a] + w_is_4g[t, s_b] <= 1)
+
+            # Homestand / roadtrip length cap across window + boundary
+            pad_start = max(0, w_start - max_ha)
+            pad_end = min(n_active - max_ha, w_end)
+            for t in range(n_teams):
+                for k in range(pad_start, pad_end):
+                    win_ha = [w_is_home[t, k + d] for d in range(max_ha + 1)]
+                    sub.Add(sum(win_ha) <= max_ha)
+                    sub.Add(sum(win_ha) >= 1)
+
+            # Subproblem Objective: Exact Haversine Miles + IsoH/IsoA + LongH/A + TZ
+            obj_terms = []
+            k_eval_start = max(1, w_start - 1)
+            k_eval_end = min(n_active - 1, w_end + 1)
+
+            for t in range(n_teams):
+                for k in range(k_eval_start, k_eval_end):
+                    ih_h = sub.NewBoolVar(f"s_isoh_{t}_{k}")
+                    sub.Add(ih_h >= w_is_home[t, k] - w_is_home[t, k - 1] - w_is_home[t, k + 1])
+                    obj_terms.append(cfg.w_isolated_home * ih_h)
+
+                    ih_a = sub.NewBoolVar(f"s_isoa_{t}_{k}")
+                    sub.Add(ih_a >= w_is_home[t, k - 1] - w_is_home[t, k] + w_is_home[t, k + 1] - 1)
+                    obj_terms.append(cfg.w_isolated_away * ih_a)
+
+                for k in range(max(1, w_start), min(n_active, w_end + 1)):
+                    rts = sub.NewBoolVar(f"s_rts_{t}_{k}")
+                    sub.Add(rts >= w_is_home[t, k - 1] - w_is_home[t, k])
+                    obj_terms.append(cfg.w_road_trip_start * rts)
+
+                if max_ha > 3 and (cfg.w_long_home != 0 or cfg.w_long_away != 0):
+                    for k in range(max(0, w_start - 3), min(n_active - 3, w_end)):
+                        w4 = [w_is_home[t, k + d] for d in range(4)]
+                        lh = sub.NewBoolVar(f"s_lh_{t}_{k}")
+                        la = sub.NewBoolVar(f"s_la_{t}_{k}")
+                        sub.Add(sum(w4) - 3 <= lh)
+                        sub.Add(1 - sum(w4) <= la)
+                        obj_terms.append(cfg.w_long_home * lh)
+                        obj_terms.append(cfg.w_long_away * la)
+
+                # Exact venue-to-venue Haversine mileage inside window & across boundaries
+                t_win_sids = team_win_home_sids[t] + team_win_away_sids[t]
+                for k in range(max(0, w_start - 1), min(n_active - 1, w_end)):
+                    s_curr, s_next = active_slots[k], active_slots[k + 1]
+                    if (s_next - s_curr) > 1:
+                        continue
+
+                    if s_curr not in win_slot_set and s_next in win_slot_set:
+                        v1 = fixed_venue[t][s_curr]
+                        for sid2 in t_win_sids:
+                            v2 = series_list[sid2]["home"]
+                            d_cost = dist_matrix[v1][v2] // 5
+                            tz_d = abs(venue_tz_val[v1] - venue_tz_val[v2])
+                            pen = -d_cost + cfg.w_tz_abs_hour * tz_d + (cfg.w_tz_shift_ge2 if tz_d >= 2 else 0)
+                            if pen != 0:
+                                obj_terms.append(pen * wx[sid2, s_next])
+
+                    elif s_curr in win_slot_set and s_next not in win_slot_set:
+                        v2 = fixed_venue[t][s_next]
+                        for sid1 in t_win_sids:
+                            v1 = series_list[sid1]["home"]
+                            d_cost = dist_matrix[v1][v2] // 5
+                            tz_d = abs(venue_tz_val[v1] - venue_tz_val[v2])
+                            pen = -d_cost + cfg.w_tz_abs_hour * tz_d + (cfg.w_tz_shift_ge2 if tz_d >= 2 else 0)
+                            if pen != 0:
+                                obj_terms.append(pen * wx[sid1, s_curr])
+
+                    elif s_curr in win_slot_set and s_next in win_slot_set:
+                        # Group team's window series by venue so we only create 1 var per venue pair
+                        sids_by_v = {}
+                        for sid in t_win_sids:
+                            sids_by_v.setdefault(series_list[sid]["home"], []).append(sid)
+                        for v1, sids1 in sids_by_v.items():
+                            expr1 = sum(wx[sid, s_curr] for sid in sids1)
+                            for v2, sids2 in sids_by_v.items():
+                                if v1 == v2:
+                                    continue
+                                d_cost = dist_matrix[v1][v2] // 5
+                                tz_d = abs(venue_tz_val[v1] - venue_tz_val[v2])
+                                pen = -d_cost + cfg.w_tz_abs_hour * tz_d + (cfg.w_tz_shift_ge2 if tz_d >= 2 else 0)
+                                if pen < 0:
+                                    expr2 = sum(wx[sid, s_next] for sid in sids2)
+                                    tr_v = sub.NewBoolVar(f"tr_{t}_{k}_{v1}_{v2}")
+                                    sub.Add(tr_v >= expr1 + expr2 - 1)
+                                    obj_terms.append(pen * tr_v)
+
+            sub.Maximize(sum(obj_terms))
+            sub_solver = cp_model.CpSolver()
+            sub_solver.parameters.max_time_in_seconds = 8.0
+            sub_solver.parameters.num_search_workers = num_workers
+            st = sub_solver.Solve(sub)
+            if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                for sid in win_sids:
+                    for s in win_slots:
+                        if sub_solver.Value(wx[sid, s]) == 1:
+                            curr_assign[sid] = s
+                            break
+
+        pass_miles = compute_total_miles(curr_assign)
+        print(f"  [Phase 3 Pass {pass_num}/2] League travel reduced to: {pass_miles:,} miles")
+
+    final_miles = compute_total_miles(curr_assign)
+    print(f"Phase 3 complete: Total travel reduced from {initial_miles:,} to {final_miles:,} miles (-{initial_miles - final_miles:,} mi).")
+    return curr_assign
 
 
 # ==============================================================================
@@ -1170,55 +1289,55 @@ def solve_schedule_slots(
     #    scaled by distance // 10. This requires ONLY 1 boolean per (away_series, slot) —
     #    ZERO quadratic series pairs! It strongly penalizes 1-series cross-country trips
     #    and forces West/East teams to stay on the road for 2-3 series once they fly out.
-    ha_flight_10mi_terms = []
-    for t in range(n_teams):
-        for sid in away_series_by_team[t]:
-            h_venue = series_list[sid]["home"]
-            d_10 = dist_matrix[t][h_venue] // 10
-            if d_10 <= 0:
-                continue
+    # ha_flight_10mi_terms = []
+    # for t in range(n_teams):
+    #     for sid in away_series_by_team[t]:
+    #         h_venue = series_list[sid]["home"]
+    #         d_10 = dist_matrix[t][h_venue] // 10
+    #         if d_10 <= 0:
+    #             continue
 
-            for k in range(n_active - 1):
-                s_curr, s_next = active_slots[k], active_slots[k + 1]
-                if (s_next - s_curr) > 1:
-                    continue
+    #         for k in range(n_active - 1):
+    #             s_curr, s_next = active_slots[k], active_slots[k + 1]
+    #             if (s_next - s_curr) > 1:
+    #                 continue
 
-                # Outbound flight: Home in k -> Away(sid) in k+1
-                # Linear inequality: fly_out >= is_home[t, k] + x[sid, s_next] - 1
-                fly_out = model.NewBoolVar(f"fo_{t}_{k}_{sid}")
-                model.Add(fly_out >= is_home[t, k] + x[sid, s_next] - 1)
-                ha_flight_10mi_terms.append(d_10 * fly_out)
+    #             # Outbound flight: Home in k -> Away(sid) in k+1
+    #             # Linear inequality: fly_out >= is_home[t, k] + x[sid, s_next] - 1
+    #             fly_out = model.NewBoolVar(f"fo_{t}_{k}_{sid}")
+    #             model.Add(fly_out >= is_home[t, k] + x[sid, s_next] - 1)
+    #             ha_flight_10mi_terms.append(d_10 * fly_out)
 
-                # Inbound flight: Away(sid) in k -> Home in k+1
-                # Linear inequality: fly_in >= x[sid, s_curr] + is_home[t, k+1] - 1
-                fly_in = model.NewBoolVar(f"fi_{t}_{k}_{sid}")
-                model.Add(fly_in >= x[sid, s_curr] + is_home[t, k + 1] - 1)
-                ha_flight_10mi_terms.append(d_10 * fly_in)
+    #             # Inbound flight: Away(sid) in k -> Home in k+1
+    #             # Linear inequality: fly_in >= x[sid, s_curr] + is_home[t, k+1] - 1
+    #             fly_in = model.NewBoolVar(f"fi_{t}_{k}_{sid}")
+    #             model.Add(fly_in >= x[sid, s_curr] + is_home[t, k + 1] - 1)
+    #             ha_flight_10mi_terms.append(d_10 * fly_in)
 
-    # 2. Tight Regional Road Pairing Bonus (<= 350 miles between consecutive away hosts)
-    regional_road_pairs = []
-    if cfg.w_regional_road_pair != 0:
-        for t in range(n_teams):
-            a_sids = away_series_by_team[t]
-            for k in range(n_active - 1):
-                s_curr, s_next = active_slots[k], active_slots[k + 1]
-                if (s_next - s_curr) > 1:
-                    continue
+    # # 2. Tight Regional Road Pairing Bonus (<= 350 miles between consecutive away hosts)
+    # regional_road_pairs = []
+    # if cfg.w_regional_road_pair != 0:
+    #     for t in range(n_teams):
+    #         a_sids = away_series_by_team[t]
+    #         for k in range(n_active - 1):
+    #             s_curr, s_next = active_slots[k], active_slots[k + 1]
+    #             if (s_next - s_curr) > 1:
+    #                 continue
 
-                slot_c_vars = []
-                for sid1 in a_sids:
-                    h1 = series_list[sid1]["home"]
-                    for sid2 in a_sids:
-                        h2 = series_list[sid2]["home"]
-                        if h1 != h2 and dist_matrix[h1][h2] <= 350:
-                            c_var = model.NewBoolVar(f"cl_{t}_{k}_{sid1}_{sid2}")
-                            model.Add(c_var <= x[sid1, s_curr])
-                            model.Add(c_var <= x[sid2, s_next])
-                            regional_road_pairs.append(c_var)
-                            slot_c_vars.append(c_var)
-                if slot_c_vars:
-                    model.Add(sum(slot_c_vars) <= 1 - is_home[t, k])
-                    model.Add(sum(slot_c_vars) <= 1 - is_home[t, k + 1])
+    #             slot_c_vars = []
+    #             for sid1 in a_sids:
+    #                 h1 = series_list[sid1]["home"]
+    #                 for sid2 in a_sids:
+    #                     h2 = series_list[sid2]["home"]
+    #                     if h1 != h2 and dist_matrix[h1][h2] <= 350:
+    #                         c_var = model.NewBoolVar(f"cl_{t}_{k}_{sid1}_{sid2}")
+    #                         model.Add(c_var <= x[sid1, s_curr])
+    #                         model.Add(c_var <= x[sid2, s_next])
+    #                         regional_road_pairs.append(c_var)
+    #                         slot_c_vars.append(c_var)
+    #             if slot_c_vars:
+    #                 model.Add(sum(slot_c_vars) <= 1 - is_home[t, k])
+    #                 model.Add(sum(slot_c_vars) <= 1 - is_home[t, k + 1])
 
     # --------------------------------------------------------------------------
     # 2-DAY OFF-DAY GAPS (Inter-series gaps == 2 days)
@@ -1240,7 +1359,7 @@ def solve_schedule_slots(
                     model.Add(g2 >= 1 - is_4g[t, s1] - is_4g[t, s2])
                     gaps_2d_vars.append(g2)
 
-    # Phase 2 Objective
+    # Lean Phase 2 Objective (~42,000 booleans so all CP-SAT LNS workers run at full speed)
     model.Maximize(
         cfg.w_early_late_div * sum(div_early_late_terms)
         + cfg.w_isolated_home * sum(isolated_home_vars)
@@ -1258,8 +1377,6 @@ def solve_schedule_slots(
         + cfg.w_tz_shift_ge2 * sum(tz_shifts_ge2_vars)
         + cfg.w_tz_abs_hour * sum(tz_abs_vars)
         + cfg.w_gap_2d * sum(gaps_2d_vars)
-        + cfg.w_regional_road_pair * sum(regional_road_pairs)
-        - 2 * sum(ha_flight_10mi_terms)
     )
 
     solver = cp_model.CpSolver()
@@ -1294,7 +1411,9 @@ def solve_schedule_slots(
                 assignment[sid] = s
                 break
 
-    assignment = optimize_away_leg_ordering(teams, slots, series_list, assignment, dist_matrix, season_year)
+    assignment = optimize_away_leg_ordering(
+        teams, slots, series_list, assignment, dist_matrix, season_year, num_workers=num_workers, cfg=cfg
+    )
 
     missed_apr_pairs = [f"{a}-{b}" for a, b, ma, _ in div_pair_meta if solver.Value(ma) == 1]
     missed_sep_pairs = [f"{a}-{b}" for a, b, _, ms in div_pair_meta if solver.Value(ms) == 1]
@@ -1323,7 +1442,7 @@ def solve_schedule_slots(
         "tz_shifts_ge2": sum(solver.Value(v) for v in tz_shifts_ge2_vars),
         "tz_abs_hours": sum(solver.Value(v) for v in tz_abs_vars),
         "gaps_2d": sum(solver.Value(v) for v in gaps_2d_vars),
-        "clust_rt_pairs": sum(solver.Value(v) for v in regional_road_pairs)
+        "clust_rt_pairs": 0
     }
     return assignment, metrics
 
