@@ -1,0 +1,114 @@
+Write a complete, production-ready Python script that pulls MLB team/venue metadata and solves an optimal league-wide regular season schedule for all 30 teams using Google OR-Tools CP-SAT.
+
+1. Data Ingestion & Setup:
+- Fetch active MLB teams, venues, geographic coordinates (latitude, longitude), and division alignment from the MLB Stats API:
+  Endpoint: https://statsapi.mlb.com/api/v1/teams?sportId=1&hydrate=venue(location)
+- Include hardcoded fallback metadata for all 30 MLB teams (team name, league, division, venue name, lat/lon coordinates) so the script can execute completely offline if the endpoint fails.
+- Build a symmetric 30x30 great-circle distance matrix (in miles) using the Haversine formula.
+
+2. Calendar Structure & Time Slot Architecture:
+- Season duration: Assume target season runs March 25 to September 26 (~26 weeks).
+- All-Star Break: Blackout July 12 through July 15 (All-Star Game on July 13).
+- Model the schedule at the SERIES level first, then expand to daily games:
+  * Divide the season into ~52 distinct Series Slots (Slot A: Midweek; Slot B: Weekend).
+  * Standard Midweek series run Tuesday–Thursday (Monday off/travel).
+  * Standard Weekend series run Friday–Sunday (Thursday off/travel).
+  * Mondays and Thursdays are allowed to have games if necessary to fit the schedule.  In this case, schedule the day games when a team needs to travel to the next city.
+  * Holiday Exceptions: On Memorial Day (Monday), July 4th (fixed date), and Labor Day (Monday), shift or extend the series slot to a 4-game wrap-around (e.g., Friday–Monday) so that ALL 30 teams play on these three holidays (no off-days for any team on these dates).
+
+3. Schedule Composition (162 games per team; 2,430 total games):
+- Intradivision (52 games): Exactly 13 games vs. each of 4 division opponents.
+  * Must be split into four series per opponent: three 3-game series and one 4-game series (7 Home / 6 Away or 6 Home / 7 Away).
+- Intraleague Non-Division (64 games): 6 to 7 games per opponent across the 10 other league teams (split into two series per opponent: 3-3 or 3-4).
+- Interleague (46 games): Remaining games against opposite-league teams in 3-game series.
+- All scheduled series must be either 3 or 4 games.
+
+4. Optimization Constraints (Google OR-Tools CP-SAT):
+- Hard Constraints:
+  * Balance: Exactly 81 home games and 81 away games per team over the season.
+  * Symmetry: Every home series for Team A vs Team B must be paired as an away series for Team B vs Team A in the same slot.
+  * No Double-Booking: Each team plays in exactly one series per slot.
+  * Divisional Spacing:
+    - For every team, at least one series against each of its 4 divisional opponents must occur on or before April 30.
+    - For every team, at least one series against each of its 4 divisional opponents must occur on or after September 1.
+  * Road Trip & Homestand Lengths:
+    - Maximum consecutive away series: 3 series (max 10-12 games).
+    - Minimum consecutive away series on a road trip: 2 series (avoid single-series road trips except at season boundaries).
+    - Maximum consecutive home series: 3 series (max 10-12 games).
+- Soft Objectives (Multi-objective optimization):
+  * Minimize total travel distance across all 30 teams (penalty based on distance matrix between consecutive series locations).
+  * Maximize the proportion of divisional series placed within the first 4 weeks and final 4 weeks of the season.
+  * Minimize isolated single-series homestands.
+
+5. Execution & Output:
+- Implement a two-phase solve or hierarchical CP-SAT model to ensure quick convergence (under 3–5 minutes runtime).
+- Expand the series matrix into a day-by-day game schedule.
+- Output a pandas DataFrame and export to 'mlb_schedule.csv' with columns:
+  [Date, DayOfWeek, SeriesSlot, HomeTeam, AwayTeam, SeriesGameNumber, TotalSeriesGames, TravelDistanceMiles].
+- Print summary metrics:
+  * Total solve runtime and solver status (OPTIMAL/FEASIBLE).
+  * Travel distance totals (league-wide and by team).
+  * Validation checks confirming all 30 teams play exactly 162 games (81 H / 81 A) and divisional count checks.
+
+
+
+  
+The 2026 MLB schedule was missing some division rivalry matchups both early and late in the season
+
+The 2026 MLB schedule was missing some division rivalry matchups both early and late in the season, so I wanted to see if I could improve on it by building my own version of the schedule for all 30 teams.  Along the way, I learned a lot about what MLB prioritizes in their own scheduling model.
+
+These are the main problems I was trying to solve:
+1. Division Rivals: Teams were missing matchups against division rivals both early in the season as well as late in the season.  (e.g.: the first Braves vs Mets series didn't happen until June 12th and the last game was August 12th.)
+2. Public Holidays: Teams weren't making full use of public holidays.  4 teams were missing games on Memorial Day.  8 teams were missing games on Labor Day.  2 teams were missing games on Father's Day.
+3. Planned Double-headers: Looking at the official 2027 schedule, MLB already has the Padres scheduled for two double-headers vs the Cubs and Colorado, and the season hasn't even started yet.  Every other team has 0 planned double-headers.  This puts those three teams at an unforced disadvantage.
+4. Long Sequences: Some teams are playing too many consecutive days without an off-day.  In 2027, there will be 19 teams that have a sequence of 16+ days with no days off, and 7 of those teams have two sequences of 17 consecutive days without a break.  This stresses those teams' depth unnecessarily and creates an unfair playing condition.
+
+
+Basic scheduling constraints from the CBA can be found [here](https://registrationz.mlbpa.org/pdf/MLB%20Basic%20Agreement%202022-26.pdf), refer to Article V.
+
+
+Some limitations in this model:
+* I'm sure some teams have certain days where they've committed to use the stadium for other events such as concerts, and I'm not taking those into account.  Not sure if there's a central repository that has that.
+
+
+
+# 3. PHASE 1: SERIES MATRIX & GAME QUOTA SOLVER (52 SERIES / 162 GAMES PER TEAM)
+# 4. PHASE 2: TEMPORAL SLOT & ROUTING CP-SAT OPTIMIZER WITH LIVE PROGRESS
+# Phase 3 Post-Optimization Sliding-Window LNS Polish
+
+Phase 1: decide on series matchups and construct the building blocks of each series taking into account requirements for number of games from divisional matchups and interleague matchups
+Phase 2: assign each series to calendar slots
+Phase 3: post-processing the schedule to minimize travel distance
+
+
+
+with teams as (
+    select hometeam as team from data
+    union
+    select awayteam as team from data
+), team_seq as (
+    select distinct t.team, d.date::date as dt
+    from data d
+    inner join teams t
+    on d.hometeam = t.team or d.awayteam = t.team
+), numbered as (
+    select team,dt,dt - row_number() over (partition by team order by dt)::int as grp
+    from team_seq
+), team_ranges as (
+select team,min(dt) as range_start,max(dt) as range_end,count(*) as consecutive_days
+from numbered
+group by team,grp
+order by team,range_start
+)
+select team,count(1) as long_sequences,max(consecutive_days),avg(consecutive_days)
+from team_ranges
+where consecutive_days>15
+group by 1
+order by 3 desc
+
+
+2027 official
+7.324283559577677
+
+2027 proposed
+7.168141592920354

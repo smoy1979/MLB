@@ -40,15 +40,18 @@ class ScheduleConfig:
     name: str = "custom"
 
     # --- Hard Constraint Toggles & Thresholds ---
-    max_consec_play_days_hard: int = 16
-    soft_streak_threshold: int = 9
-    max_homestand_roadtrip_hard: int = 4
+    max_consec_play_days_hard: int = 20       # CBA Article V hard cap: <= 20 consecutive playing days
+    soft_streak_threshold: int = 9            # Soft penalty threshold (>9 consecutive playing days)
+    max_homestand_roadtrip_hard: int = 4      # Hard max series in a row
     enforce_no_b2b_div_hard: bool = True
     force_no_asg_thursday_hard: bool = False
+    max_asg_thursday_games_hard: int = 1      # CBA rule: at most 1 game league-wide on ASG Thursday
     max_isolated_series_per_team: int = 0
+    max_pdt_to_edt_no_off_league: int = 7     # CBA rule: <= 7 PDT->EDT transitions without an off-day
+    max_pdt_to_edt_no_off_per_team: int = 1   # CBA rule: <= 1 PDT->EDT without off-day per Club
 
     # --- Soft Objective Weights ---
-    w_early_late_div: int = 150
+    w_early_late_div: int = 900               # Turned up to strongly incentivize Apr/Sep divisional play
     w_isolated_home: int = -250
     w_isolated_away: int = -400
     w_long_home: int = -650
@@ -59,7 +62,7 @@ class ScheduleConfig:
     w_div_31d_excess: int = -300
     w_div_91d_gap: int = -300
     w_asg_thursday_game: int = -1000
-    w_streak_over_threshold: int = -150
+    w_streak_over_threshold: int = -300       # Turned up to strongly suppress >9d playing streaks
     w_consec_dow_off: int = -150
     w_tz_shift_ge2: int = -250
     w_tz_abs_hour: int = -125
@@ -393,6 +396,69 @@ def optimize_away_leg_ordering(
                         for t in range(n_teams):
                             sub.Add(w_is_4g[t, s_a] + w_is_4g[t, s_b] <= 1)
 
+            # Exact Daily Playing Streak Hard Cap & Soft Penalty in Phase 3
+            season_start_date = slots[0]["dates_4g"][0]
+            season_end_date = slots[-1]["dates_4g"][-1]
+            total_cal_days = (season_end_date - season_start_date).days + 1
+            cal_dates = [season_start_date + datetime.timedelta(days=d) for d in range(total_cal_days)]
+            slot_by_idx = {s["slot_idx"]: s for s in slots}
+
+            win_min_date = slots[win_slots[0]]["dates_4g"][0] - datetime.timedelta(days=21)
+            win_max_date = slots[win_slots[-1]]["dates_4g"][-1] + datetime.timedelta(days=21)
+
+            p3_streak_vars = []
+            eff_hard_cap = (
+                cfg.max_consec_play_days_hard - 3
+                if cfg.max_consec_play_days_hard >= 19
+                else cfg.max_consec_play_days_hard
+            )
+
+            for t in range(n_teams):
+                play_day: Dict[datetime.date, Any] = {d: 0 for d in cal_dates}
+                for s in active_slots:
+                    s_meta = slot_by_idx[s]
+                    d3 = set(s_meta["dates_3g"])
+                    d4 = set(s_meta["dates_4g"])
+                    if s_meta["slot_type"] == "A" and (s + 1) < len(slots) and slots[s + 1].get("shares_thu_with_prev", False):
+                        s_b = s + 1
+                        mon_d, tue_d, wed_d, thu_d = s_meta["dates_4g"]
+                        play_day[tue_d] = 1
+                        play_day[wed_d] = 1
+                        play_day[thu_d] = 1
+                        play_day[mon_d] = w_is_4g[t, s] + w_is_4g[t, s_b]
+                    elif s_meta["slot_type"] == "B" and s_meta.get("shares_thu_with_prev", False) and (s - 1) in active_slots:
+                        for d in d3:
+                            play_day[d] = 1
+                    else:
+                        for d in d3.intersection(d4):
+                            play_day[d] = 1
+                        for d in (d4 - d3):
+                            play_day[d] = play_day[d] + w_is_4g[t, s]
+
+                if eff_hard_cap > 0:
+                    w_len = eff_hard_cap + 1
+                    for d_idx in range(total_cal_days - eff_hard_cap):
+                        d_start = cal_dates[d_idx]
+                        if d_start < win_min_date or d_start > win_max_date:
+                            continue
+                        win_h_days = [play_day[cal_dates[d_idx + k]] for k in range(w_len)]
+                        if any( not isinstance(v, int) for v in win_h_days ):
+                            sub.Add(sum(win_h_days) <= eff_hard_cap)
+
+                if cfg.w_streak_over_threshold != 0:
+                    s_len = cfg.soft_streak_threshold + 1
+                    for d_idx in range(total_cal_days - cfg.soft_streak_threshold):
+                        d_start = cal_dates[d_idx]
+                        if d_start < win_min_date or d_start > win_max_date:
+                            continue
+                        win_s_days = [play_day[cal_dates[d_idx + k]] for k in range(s_len)]
+                        if any(isinstance(v, int) and v == 0 for v in win_s_days):
+                            continue
+                        if any(not isinstance(v, int) for v in win_s_days):
+                            ov_s = sub.NewBoolVar(f"p3_strk_{t}_{d_idx}")
+                            sub.Add(ov_s >= sum(win_s_days) - cfg.soft_streak_threshold)
+                            p3_streak_vars.append(ov_s)
+
             # Homestand / roadtrip length cap across window + boundary
             pad_start = max(0, w_start - max_ha)
             pad_end = min(n_active - max_ha, w_end)
@@ -526,16 +592,8 @@ def optimize_away_leg_ordering(
                     if (s2 - s1) > 1:
                         continue
                     # Penalize back-to-back 4g series across adjacent weeks (which create >9d streaks)
-                    if cfg.w_streak_over_threshold != 0:
-                        # If a team plays a 4g series in slot k, any 4g series in k+1 or k+2 extends >9d streak
-                        for step in (1, 2):
-                            if k + step < n_active:
-                                s_step = active_slots[k + step]
-                                if (s_step - s1) <= 2:
-                                    b_strk = sub.NewBoolVar(f"s_strk_{t}_{k}_{step}")
-                                    sub.Add(b_strk >= w_is_4g[t, s1] + w_is_4g[t, s_step] - 1)
-                                    # Each clustered 4g series pair adds ~3 excess streak days
-                                    obj_terms.append(3 * cfg.w_streak_over_threshold * b_strk)
+                    if p3_streak_vars and cfg.w_streak_over_threshold != 0:
+                        obj_terms.append(cfg.w_streak_over_threshold * sum(p3_streak_vars))
 
                     if cfg.w_gap_2d != 0:
                         if slots[s1]["slot_type"] == "A" and slots[s2]["slot_type"] == "B":
@@ -1163,7 +1221,7 @@ def solve_schedule_slots(
             consec_dow_off_penalties.append(thu_pen)
 
     # --------------------------------------------------------------------------
-    # CONSECUTIVE PLAYING DAYS: Hard < 17 Days (<= 16 days), Soft Penalty > 9 Days
+    # CONSECUTIVE PLAYING DAYS: Exact Calendar Day Mapping (Fixes Slot B 4g Shift)
     # --------------------------------------------------------------------------
     season_start_date = slots[0]["dates_4g"][0]
     season_end_date = slots[-1]["dates_4g"][-1]
@@ -1180,16 +1238,43 @@ def solve_schedule_slots(
             s_meta = slot_by_idx[s]
             d3 = set(s_meta["dates_3g"])
             d4 = set(s_meta["dates_4g"])
-            for d in d3.intersection(d4):
-                play_day[d] = 1
-            for d in (d4 - d3):
-                play_day[d] = play_day[d] + is_4g[t, s]
+
+            if s_meta["slot_type"] == "A" and (s + 1) < len(slots) and slots[s + 1].get("shares_thu_with_prev", False):
+                # Standard week (Slot A + Slot B sharing Thursday):
+                # Tue & Wed are always played.
+                # If team plays 4g in Slot A OR 4g in Slot B (which shifts Slot A to Mon-Wed),
+                # then BOTH Monday and Thursday are played!
+                s_b = s + 1
+                mon_d = s_meta["dates_4g"][0]
+                tue_d = s_meta["dates_4g"][1]
+                wed_d = s_meta["dates_4g"][2]
+                thu_d = s_meta["dates_4g"][3]
+                play_day[tue_d] = 1
+                play_day[wed_d] = 1
+                play_day[thu_d] = 1
+                play_day[mon_d] = is_4g[t, s] + is_4g[t, s_b]
+            elif s_meta["slot_type"] == "B" and s_meta.get("shares_thu_with_prev", False) and (s - 1) in active_slots:
+                # Fri, Sat, Sun are always played (Thursday already accounted for above)
+                for d in d3:
+                    play_day[d] = 1
+            else:
+                for d in d3.intersection(d4):
+                    play_day[d] = 1
+                for d in (d4 - d3):
+                    play_day[d] = play_day[d] + is_4g[t, s]
 
         if cfg.max_consec_play_days_hard > 0:
-            win_len = cfg.max_consec_play_days_hard + 1
-            for d_idx in range(total_cal_days - cfg.max_consec_play_days_hard):
+            # Reserve a 3-day buffer if cap > 16 so an opponent-forced [Mon, Tue, Wed] shift
+            # in Slot A (which adds 3 days before Thursday's off-day) never pushes a streak > cap
+            eff_hard_cap = (
+                cfg.max_consec_play_days_hard - 3
+                if cfg.max_consec_play_days_hard >= 19
+                else cfg.max_consec_play_days_hard
+            )
+            win_len = eff_hard_cap + 1
+            for d_idx in range(total_cal_days - eff_hard_cap):
                 win_hard = [play_day[cal_dates[d_idx + k]] for k in range(win_len)]
-                model.Add(sum(win_hard) <= cfg.max_consec_play_days_hard)
+                model.Add(sum(win_hard) <= eff_hard_cap)
 
         if cfg.w_streak_over_threshold != 0:
             s_win_len = cfg.soft_streak_threshold + 1
@@ -1313,6 +1398,10 @@ def solve_schedule_slots(
             if sr["games"] == 4:
                 asg_thursday_4g_vars.append(x[sid, s_post])
 
+    # CBA Rule: At most 1 game league-wide on the Thursday following the All-Star Game
+    if cfg.max_asg_thursday_games_hard >= 0:
+        model.Add(sum(asg_thursday_4g_vars) <= cfg.max_asg_thursday_games_hard)
+
     div_early_late_terms = []
     for sid, sr in enumerate(series_list):
         if sr["is_div"]:
@@ -1353,6 +1442,63 @@ def solve_schedule_slots(
             tz_ge2 = model.NewBoolVar(f"tz_ge2_{t}_{k}")
             model.Add(tz_abs - 1 <= 2 * tz_ge2)
             tz_shifts_ge2_vars.append(tz_ge2)
+
+    # --------------------------------------------------------------------------
+    # CBA RULE: PACIFIC (PDT=-3) -> EASTERN (EDT=0) WITHOUT AN OFF-DAY
+    # --------------------------------------------------------------------------
+    # No Club > 1 per season; League-wide <= 7 per season.
+    # In our slot architecture:
+    # - A transition from PDT (venue_tz_val == 3) in slot k to EDT (venue_tz_val == 0)
+    #   in slot k+1 has NO off-day if:
+    #   (a) Slot B -> Slot A: Slot B is a Monday holiday wrap OR Slot A has Mon played (is_4g[s_A] + is_4g[s_B_next] >= 1)
+    #   (b) Slot A -> Slot B: Slot B is a 4g series (is_4g[s_B] == 1) [if both Slot A and Slot B are 3g,
+    #       expand_to_daily_schedule will shift Slot A to Mon-Wed so Thursday is a guaranteed off-day!]
+    pdt_to_edt_no_off_all = []
+    for t in range(n_teams):
+        t_sids = home_series_by_team[t] + away_series_by_team[t]
+        pdt_sids = [sid for sid in t_sids if venue_tz_val[series_list[sid]["home"]] == 3]
+        edt_sids = [sid for sid in t_sids if venue_tz_val[series_list[sid]["home"]] == 0]
+        if not pdt_sids or not edt_sids:
+            continue
+
+        team_pdt_edt_no_off = []
+        for k in range(n_active - 1):
+            s_curr, s_next = active_slots[k], active_slots[k + 1]
+            if (s_next - s_curr) > 1:
+                continue  # All-Star Break has 4 off-days
+
+            in_pdt_curr = sum(x[sid, s_curr] for sid in pdt_sids)
+            in_edt_next = sum(x[sid, s_next] for sid in edt_sids)
+
+            if slots[s_curr]["slot_type"] == "A" and slots[s_next]["slot_type"] == "B":
+                # If either s_curr or s_next is 4g, there is 0 off-day between them.
+                # (If both are 3g, expand_to_daily_schedule shifts s_curr to Mon-Wed to create a Thu off-day!)
+                no_off_ab = model.NewBoolVar(f"pdt_edt_ab_{t}_{k}")
+                model.Add(no_off_ab >= in_pdt_curr + in_edt_next + is_4g[t, s_curr] + is_4g[t, s_next] - 2)
+                team_pdt_edt_no_off.append(no_off_ab)
+                pdt_to_edt_no_off_all.append(no_off_ab)
+
+            elif slots[s_curr]["slot_type"] == "B" and slots[s_next]["slot_type"] == "A":
+                if slots[s_curr].get("is_monday_holiday_wrap", False) or slots[s_next].get("holiday") == "July 4th":
+                    # Guaranteed 0 off-days (plays Mon)
+                    no_off_ba = model.NewBoolVar(f"pdt_edt_ba_hol_{t}_{k}")
+                    model.Add(no_off_ba >= in_pdt_curr + in_edt_next - 1)
+                    team_pdt_edt_no_off.append(no_off_ba)
+                    pdt_to_edt_no_off_all.append(no_off_ba)
+                else:
+                    # Has 0 off-days if team plays on Monday of s_next (4g in s_next, or 4g in s_next+1)
+                    s_next_b = s_next + 1 if (s_next + 1) in active_slots else None
+                    mon_play_expr = is_4g[t, s_next] + (is_4g[t, s_next_b] if s_next_b is not None else 0)
+                    no_off_ba = model.NewBoolVar(f"pdt_edt_ba_{t}_{k}")
+                    model.Add(no_off_ba >= in_pdt_curr + in_edt_next + mon_play_expr - 2)
+                    team_pdt_edt_no_off.append(no_off_ba)
+                    pdt_to_edt_no_off_all.append(no_off_ba)
+
+        if team_pdt_edt_no_off and cfg.max_pdt_to_edt_no_off_per_team >= 0:
+            model.Add(sum(team_pdt_edt_no_off) <= cfg.max_pdt_to_edt_no_off_per_team)
+
+    if pdt_to_edt_no_off_all and cfg.max_pdt_to_edt_no_off_league >= 0:
+        model.Add(sum(pdt_to_edt_no_off_all) <= cfg.max_pdt_to_edt_no_off_league)
 
     # --------------------------------------------------------------------------
     # DIRECT LINEAR HOME <-> AWAY FLIGHT MILEAGE & REGIONAL ROAD PAIRING
@@ -1604,15 +1750,23 @@ def expand_to_daily_schedule(
                     and slot_meta.get("dates_3g_early", slot_meta["dates_3g"]) != slot_meta["dates_3g"]
                 )
 
+                # Check if either team is traveling PDT (-3) -> EDT (0) into Slot B (next_s):
+                # Shifting Slot A to [Mon, Tue, Wed] gives them Thursday as an open travel day!
+                pdt_to_edt_into_b = False
+                if can_shift_early and next_s in slot_series and TEAM_TIMEZONES.get(h_abbr, 0) == -3:
+                    for sr_next in slot_series[next_s]:
+                        next_host_abbr = teams[sr_next["home"]]["abbr"]
+                        if TEAM_TIMEZONES.get(next_host_abbr, 0) == 0:
+                            if sr_next["home"] in (h_idx, a_idx) or sr_next["away"] in (h_idx, a_idx):
+                                pdt_to_edt_into_b = True
+                                break
+
                 if must_shift_early:
                     dates = slot_meta.get("dates_3g_early", slot_meta["dates_3g"])
                 elif can_shift_early:
-                    # Check if shifting to [Mon, Tue, Wed] helps break a Monday off-day run (>= 2 weeks)
-                    # without pushing either team's consecutive playing streak past 9 days
                     early_dates = slot_meta["dates_3g_early"]
                     mon_d = early_dates[0]
 
-                    # Count how many consecutive days each team has played leading into Monday
                     def prior_streak(t_id: int, ref_date: datetime.date) -> int:
                         cnt = 0
                         cur = ref_date - datetime.timedelta(days=1)
@@ -1624,15 +1778,18 @@ def expand_to_daily_schedule(
                     h_prior = prior_streak(h_idx, mon_d)
                     a_prior = prior_streak(a_idx, mon_d)
 
-                    # Shifting to [Mon, Tue, Wed] adds 3 days to the prior weekend streak, then gives Thu off!
-                    streak_safe = (h_prior + 3 <= 9) and (a_prior + 3 <= 9)
-                    thu_safe = (consec_thu_off[h_idx] < 2) and (consec_thu_off[a_idx] < 2)
-                    needs_mon_play = (consec_mon_off[h_idx] >= 2) or (consec_mon_off[a_idx] >= 2)
-
-                    if streak_safe and thu_safe and needs_mon_play:
+                    if pdt_to_edt_into_b and (h_prior + 3 <= 16) and (a_prior + 3 <= 16):
+                        # Shift to [Mon, Tue, Wed] to provide a Thursday open day before Eastern game
                         dates = early_dates
                     else:
-                        dates = slot_meta["dates_3g"]
+                        streak_safe = (h_prior + 3 <= 9) and (a_prior + 3 <= 9)
+                        thu_safe = (consec_thu_off[h_idx] < 2) and (consec_thu_off[a_idx] < 2)
+                        needs_mon_play = (consec_mon_off[h_idx] >= 2) or (consec_mon_off[a_idx] >= 2)
+
+                        if streak_safe and thu_safe and needs_mon_play:
+                            dates = early_dates
+                        else:
+                            dates = slot_meta["dates_3g"]
                 else:
                     dates = slot_meta["dates_3g"]
 
@@ -2179,6 +2336,31 @@ def compute_timezone_shifts_ge_2h(df: pd.DataFrame, teams: List[Dict[str, Any]])
     return total_shifts_ge_2h
 
 
+def compute_pdt_to_edt_next_day(df: pd.DataFrame, teams: List[Dict[str, Any]]) -> Tuple[int, Dict[str, int]]:
+    """
+    CBA Rule Audit:
+    Counts how many times a team plays a game in the Pacific Time Zone (tz == -3)
+    and then plays the very next calendar day (0 off-days) in the Eastern Time Zone (tz == 0).
+    Returns (league_total, per_team_counts).
+    """
+    df_temp = df.copy()
+    df_temp["DateObj"] = pd.to_datetime(df_temp["Date"]).dt.date
+    tz_map = {t["abbr"]: TEAM_TIMEZONES.get(t["abbr"], 0) for t in teams}
+    per_team = {t["abbr"]: 0 for t in teams}
+
+    for t in teams:
+        ab = t["abbr"]
+        t_games = df_temp[(df_temp["HomeTeam"] == ab) | (df_temp["AwayTeam"] == ab)].sort_values("DateObj")
+        dates = t_games["DateObj"].tolist()
+        venues = t_games["HomeTeam"].tolist()
+        for i in range(1, len(dates)):
+            if (dates[i] - dates[i - 1]).days == 1:
+                if tz_map.get(venues[i - 1], 0) == -3 and tz_map.get(venues[i], 0) == 0:
+                    per_team[ab] += 1
+
+    return sum(per_team.values()), per_team
+
+
 def compute_consecutive_dow_offdays(df: pd.DataFrame, teams: List[Dict[str, Any]], dow_target: str) -> List[Tuple[str, int]]:
     """Checks for teams with > 3 consecutive weeks where `dow_target` (e.g. 'Monday', 'Thursday') is an off-day."""
     df_temp = df.copy()
@@ -2305,6 +2487,14 @@ def run_validation_checks(
     # 3d. Check Timezone Shifts (>= 2 hours)
     tz_shifts = compute_timezone_shifts_ge_2h(df, teams)
     print(f"[INFO] League-wide timezone shifts (>= 2 hours): {tz_shifts}")
+
+    # 3e. Verify CBA Pacific -> Eastern Next-Day Rule (<= 7 league-wide, <= 1 per team)
+    pdt_edt_tot, pdt_edt_by_team = compute_pdt_to_edt_next_day(df, teams)
+    viol_clubs = {k: v for k, v in pdt_edt_by_team.items() if v > 1}
+    print(
+        f"[INFO] CBA Pacific->Eastern next-day games: {pdt_edt_tot} league-wide (limit <= 7) | "
+        f"Clubs > 1: {viol_clubs}"
+    )
 
     # 4. Check Divisional Spacing Rules (Soft Metrics: >2 series in 31d, >3 months apart)
     abbr_to_div = {t["abbr"]: t["division"] for t in teams}
@@ -2957,7 +3147,7 @@ def main(
         parquet_path = os.path.join(output_dir, f"mlb_schedule.{evaluate_year}.official.parquet")
         df_hist.to_parquet(parquet_path)
         evaluate_existing_schedule(df_hist, teams, dist_matrix, season_year=evaluate_year, cfg=cfg)
-        # generate_team_schedule_pdfs(df_hist, teams, season_year=evaluate_year, output_dir=output_dir, enable_logos=enable_logos, subtitle="official")
+        generate_team_schedule_pdfs(df_hist, teams, season_year=evaluate_year, output_dir=output_dir, enable_logos=enable_logos, subtitle="official")
         return
 
     if evaluate_csv:
