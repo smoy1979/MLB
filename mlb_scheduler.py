@@ -2954,6 +2954,8 @@ def main(
     # Mode A: Audit 2026 Official Schedule from MLB API or an existing CSV file
     if evaluate_year:
         df_hist = fetch_historical_mlb_schedule(evaluate_year, teams)
+        parquet_path = os.path.join(output_dir, f"mlb_schedule.{evaluate_year}.official.parquet")
+        df_hist.to_parquet(parquet_path)
         evaluate_existing_schedule(df_hist, teams, dist_matrix, season_year=evaluate_year, cfg=cfg)
         # generate_team_schedule_pdfs(df_hist, teams, season_year=evaluate_year, output_dir=output_dir, enable_logos=enable_logos, subtitle="official")
         return
@@ -2961,6 +2963,8 @@ def main(
     if evaluate_csv:
         print(f"\nLoading schedule from CSV '{evaluate_csv}' for evaluation...")
         df_csv = pd.read_csv(evaluate_csv)
+        parquet_path = os.path.join(output_dir, f"mlb_schedule.{season_year}.proposed.parquet")
+        df_csv.to_parquet(parquet_path)
         evaluate_existing_schedule(df_csv, teams, dist_matrix, season_year=season_year, cfg=cfg)
         # generate_team_schedule_pdfs(df_csv, teams, season_year=season_year, output_dir=output_dir, enable_logos=enable_logos, subtitle="proposed")
         return

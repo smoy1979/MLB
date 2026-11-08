@@ -3,3 +3,4 @@ pulp
 ortools
 requests
 reportlab
+pyarrow
