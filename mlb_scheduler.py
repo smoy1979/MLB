@@ -65,6 +65,7 @@ class ScheduleConfig:
     w_tz_abs_hour: int = -125
     w_gap_2d: int = -100
     w_regional_road_pair: int = 0
+    w_miles_per_10mi: int = -1
 
 
 def get_schedule_config(profile: str = "custom") -> ScheduleConfig:
@@ -96,6 +97,7 @@ def get_schedule_config(profile: str = "custom") -> ScheduleConfig:
             w_tz_abs_hour=-300,
             w_gap_2d=0,
             w_regional_road_pair=350,         # Strong bonus for chaining close away venues
+            w_miles_per_10mi=-2,
         )
     return ScheduleConfig(name="custom")
 
@@ -400,6 +402,38 @@ def optimize_away_leg_ordering(
                     sub.Add(sum(win_ha) <= max_ha)
                     sub.Add(sum(win_ha) >= 1)
 
+            # Precompute early/late slot set and divisional pair series in window
+            first_4w_slots = active_slots[:8]
+            final_4w_slots = active_slots[-8:]
+            early_late_slots = set(first_4w_slots + final_4w_slots)
+
+            # Enforce hard no-back-to-back divisional series inside window if enabled in cfg
+            if cfg.enforce_no_b2b_div_hard:
+                div_pair_sids: Dict[Tuple[int, int], List[int]] = {}
+                for sid in range(len(series_list)):
+                    sr = series_list[sid]
+                    if sr["is_div"]:
+                        pk = (min(sr["home"], sr["away"]), max(sr["home"], sr["away"]))
+                        div_pair_sids.setdefault(pk, []).append(sid)
+
+                for pk, sids in div_pair_sids.items():
+                    for k in range(max(0, w_start - 1), min(n_active - 1, w_end)):
+                        s_curr, s_next = active_slots[k], active_slots[k + 1]
+                        if s_curr not in win_slot_set and s_next not in win_slot_set:
+                            continue
+                        terms = []
+                        for sid in sids:
+                            if s_curr in win_slot_set and sid in win_sids:
+                                terms.append(wx[sid, s_curr])
+                            elif s_curr not in win_slot_set and curr_assign[sid] == s_curr:
+                                terms.append(1)
+                            if s_next in win_slot_set and sid in win_sids:
+                                terms.append(wx[sid, s_next])
+                            elif s_next not in win_slot_set and curr_assign[sid] == s_next:
+                                terms.append(1)
+                        if terms:
+                            sub.Add(sum(terms) <= 1)
+
             # Subproblem Objective: Exact Haversine Miles + IsoH/IsoA + LongH/A + TZ
             obj_terms = []
             k_eval_start = max(1, w_start - 1)
@@ -441,9 +475,9 @@ def optimize_away_leg_ordering(
                         v1 = fixed_venue[t][s_curr]
                         for sid2 in t_win_sids:
                             v2 = series_list[sid2]["home"]
-                            d_cost = dist_matrix[v1][v2] // 5
+                            d_cost = cfg.w_miles_per_10mi * (dist_matrix[v1][v2] // 10)
                             tz_d = abs(venue_tz_val[v1] - venue_tz_val[v2])
-                            pen = -d_cost + cfg.w_tz_abs_hour * tz_d + (cfg.w_tz_shift_ge2 if tz_d >= 2 else 0)
+                            pen = d_cost + cfg.w_tz_abs_hour * tz_d + (cfg.w_tz_shift_ge2 if tz_d >= 2 else 0)
                             if pen != 0:
                                 obj_terms.append(pen * wx[sid2, s_next])
 
@@ -451,9 +485,9 @@ def optimize_away_leg_ordering(
                         v2 = fixed_venue[t][s_next]
                         for sid1 in t_win_sids:
                             v1 = series_list[sid1]["home"]
-                            d_cost = dist_matrix[v1][v2] // 5
+                            d_cost = cfg.w_miles_per_10mi * (dist_matrix[v1][v2] // 10)
                             tz_d = abs(venue_tz_val[v1] - venue_tz_val[v2])
-                            pen = -d_cost + cfg.w_tz_abs_hour * tz_d + (cfg.w_tz_shift_ge2 if tz_d >= 2 else 0)
+                            pen = d_cost + cfg.w_tz_abs_hour * tz_d + (cfg.w_tz_shift_ge2 if tz_d >= 2 else 0)
                             if pen != 0:
                                 obj_terms.append(pen * wx[sid1, s_curr])
 
@@ -467,14 +501,52 @@ def optimize_away_leg_ordering(
                             for v2, sids2 in sids_by_v.items():
                                 if v1 == v2:
                                     continue
-                                d_cost = dist_matrix[v1][v2] // 5
+                                d_cost = cfg.w_miles_per_10mi * (dist_matrix[v1][v2] // 10)
                                 tz_d = abs(venue_tz_val[v1] - venue_tz_val[v2])
-                                pen = -d_cost + cfg.w_tz_abs_hour * tz_d + (cfg.w_tz_shift_ge2 if tz_d >= 2 else 0)
+                                pen = d_cost + cfg.w_tz_abs_hour * tz_d + (cfg.w_tz_shift_ge2 if tz_d >= 2 else 0)
                                 if pen < 0:
                                     expr2 = sum(wx[sid, s_next] for sid in sids2)
                                     tr_v = sub.NewBoolVar(f"tr_{t}_{k}_{v1}_{v2}")
                                     sub.Add(tr_v >= expr1 + expr2 - 1)
                                     obj_terms.append(pen * tr_v)
+
+            # 1. Early/Late Divisional Series dial & ASG Thursday dial
+            for sid in win_sids:
+                sr = series_list[sid]
+                for s in win_slots:
+                    if sr["is_div"] and s in early_late_slots and cfg.w_early_late_div != 0:
+                        obj_terms.append(cfg.w_early_late_div * wx[sid, s])
+                    if sr["games"] == 4 and slots[s].get("is_post_asg", False) and cfg.w_asg_thursday_game != 0:
+                        obj_terms.append(cfg.w_asg_thursday_game * wx[sid, s])
+
+            # 2. 2-Day Inter-Series Off-Day Gaps & 4-Game Series Streak Pressure
+            for t in range(n_teams):
+                for k in range(max(0, w_start - 1), min(n_active - 1, w_end)):
+                    s1, s2 = active_slots[k], active_slots[k + 1]
+                    if (s2 - s1) > 1:
+                        continue
+                    # Penalize back-to-back 4g series across adjacent weeks (which create >9d streaks)
+                    if cfg.w_streak_over_threshold != 0:
+                        # If a team plays a 4g series in slot k, any 4g series in k+1 or k+2 extends >9d streak
+                        for step in (1, 2):
+                            if k + step < n_active:
+                                s_step = active_slots[k + step]
+                                if (s_step - s1) <= 2:
+                                    b_strk = sub.NewBoolVar(f"s_strk_{t}_{k}_{step}")
+                                    sub.Add(b_strk >= w_is_4g[t, s1] + w_is_4g[t, s_step] - 1)
+                                    # Each clustered 4g series pair adds ~3 excess streak days
+                                    obj_terms.append(3 * cfg.w_streak_over_threshold * b_strk)
+
+                    if cfg.w_gap_2d != 0:
+                        if slots[s1]["slot_type"] == "A" and slots[s2]["slot_type"] == "B":
+                            g2 = sub.NewBoolVar(f"s_g2_{t}_{k}")
+                            sub.Add(g2 >= 1 - w_is_4g[t, s1] - w_is_4g[t, s2])
+                            obj_terms.append(cfg.w_gap_2d * g2)
+                        elif slots[s1]["slot_type"] == "B" and slots[s2]["slot_type"] == "A":
+                            if not slots[s1].get("is_monday_holiday_wrap", False) and slots[s2].get("holiday") != "July 4th":
+                                g2 = sub.NewBoolVar(f"s_g2_{t}_{k}")
+                                sub.Add(g2 >= 1 - w_is_4g[t, s1] - w_is_4g[t, s2])
+                                obj_terms.append(cfg.w_gap_2d * g2)
 
             sub.Maximize(sum(obj_terms))
             sub_solver = cp_model.CpSolver()
