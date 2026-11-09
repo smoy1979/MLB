@@ -44,21 +44,21 @@ class ScheduleConfig:
     soft_streak_threshold: int = 9            # Soft penalty threshold (>9 consecutive playing days)
     max_homestand_roadtrip_hard: int = 4      # Hard max series in a row
     enforce_no_b2b_div_hard: bool = True
-    force_no_asg_thursday_hard: bool = False
+    force_no_asg_thursday_hard: bool = True
     max_asg_thursday_games_hard: int = 1      # CBA rule: at most 1 game league-wide on ASG Thursday
     max_isolated_series_per_team: int = 0
     max_pdt_to_edt_no_off_league: int = 7     # CBA rule: <= 7 PDT->EDT transitions without an off-day
     max_pdt_to_edt_no_off_per_team: int = 1   # CBA rule: <= 1 PDT->EDT without off-day per Club
 
     # --- Soft Objective Weights ---
-    w_early_late_div: int = 900               # Turned up to strongly incentivize Apr/Sep divisional play
+    w_early_late_div: int = 400               # Turned up to strongly incentivize Apr/Sep divisional play
     w_isolated_home: int = -250
     w_isolated_away: int = -400
     w_long_home: int = -650
     w_long_away: int = -650
     w_road_trip_start: int = -50
-    w_missed_april_div: int = -1500
-    w_missed_sept_div: int = -1500
+    w_missed_april_div: int = -2000
+    w_missed_sept_div: int = -3000
     w_div_31d_excess: int = -300
     w_div_91d_gap: int = -300
     w_asg_thursday_game: int = -1000
@@ -1949,16 +1949,10 @@ def generate_team_schedule_pdfs(
     subtitle: str = "",
 ) -> None:
     """
-    Generates 30 individual ONE-PAGE Portrait PDF calendars (`data/mlb_schedule_<ABBR>_<YEAR>.pdf`):
-      - 1 single page per team (Letter Portrait: 612 x 792 pt).
-      - 2 columns x 3 rows grid of month blocks (left-to-right, then top-to-bottom):
-          Row 0: March / April (combined) | May
-          Row 1: June                     | July
-          Row 2: August                   | September (or September / October if games in Oct)
-      - White background for regular games; Yellow background (#FEF08A) for Doubleheaders.
-      - Inset thick navy blue border (#0A1E3F, 3.0 pt) for Home games; thin border for Road games.
-      - Tuesday All-Star Game (ASG) highlighted with a true gold badge; Mon/Wed/Thu ASG Break shaded.
-      - Clean date number in top-left; Opponent logo/text badge in center.
+    Generates:
+      1. 30 individual ONE-PAGE Portrait PDF calendars (`mlb_schedule_<ABBR>_<YEAR>_<subtitle>.pdf`)
+      2. 6 divisional FIVE-PAGE Portrait PDF calendars (`mlb_schedule_<DIV>_<YEAR>_<subtitle>.pdf`)
+    All stored in `<output_dir>/<subtitle> <season_year>/`.
     """
     output_dir = f"{output_dir}/{subtitle} {season_year}"
     os.makedirs(output_dir, exist_ok=True)
@@ -1987,10 +1981,9 @@ def generate_team_schedule_pdfs(
     home_border_w = 3.0
     half_hb = home_border_w / 2.0
 
-    for t in teams:
+    def _render_team_page_on_canvas(c: canvas.Canvas, t: Dict[str, Any]) -> None:
         abbr = t["abbr"]
         team_name = t["name"]
-        pdf_path = os.path.join(output_dir, f"mlb_schedule_{abbr}_{season_year}_{subtitle}.pdf")
 
         t_df = df[(df["HomeTeam"] == abbr) | (df["AwayTeam"] == abbr)].copy()
         t_df["DateObj"] = pd.to_datetime(t_df["Date"]).dt.date
@@ -2024,8 +2017,6 @@ def generate_team_schedule_pdfs(
             periods.append(("SEPTEMBER / OCTOBER", datetime.date(season_year, 9, 1), oct_end, {9, 10}))
         else:
             periods.append(("SEPTEMBER", datetime.date(season_year, 9, 1), datetime.date(season_year, 9, 30), {9}))
-
-        c = canvas.Canvas(pdf_path, pagesize=letter)
 
         # Top Banner
         c.setFillColor(navy)
@@ -2242,9 +2233,31 @@ def generate_team_schedule_pdfs(
                     curr_d += datetime.timedelta(days=1)
 
         c.showPage()
-        c.save()
 
-    print(f"Generated 30 1-page team schedule PDFs in '{output_dir}/mlb_schedule_<TEAM>_<SEASON>.pdf'.")
+    # 1. Generate 30 Individual Team PDFs
+    for t in teams:
+        abbr = t["abbr"]
+        pdf_path = os.path.join(output_dir, f"mlb_schedule_{abbr}_{season_year}_{subtitle}.pdf")
+        c_team = canvas.Canvas(pdf_path, pagesize=letter)
+        _render_team_page_on_canvas(c_team, t)
+        c_team.save()
+
+    # 2. Generate 6 Multi-Page Division PDFs (1 page per team in the division)
+    teams_by_div: Dict[str, List[Dict[str, Any]]] = {}
+    for t in teams:
+        teams_by_div.setdefault(t["division"], []).append(t)
+
+    for div_name, div_teams in sorted(teams_by_div.items()):
+        div_slug = div_name.replace(" ", "_")
+        div_pdf_path = os.path.join(output_dir, f"mlb_schedule_{div_slug}_{season_year}_{subtitle}.pdf")
+        c_div = canvas.Canvas(div_pdf_path, pagesize=letter)
+        for t in sorted(div_teams, key=lambda x: x["abbr"]):
+            _render_team_page_on_canvas(c_div, t)
+        c_div.save()
+
+    print(
+        f"Generated 30 1-page team PDFs and {len(teams_by_div)} 5-page division PDFs in '{output_dir}/'."
+    )
 
 
 def compute_team_playing_streaks(
@@ -2910,8 +2923,8 @@ def evaluate_existing_schedule(
     season_end = max(df["DateObj"])
     early_cutoff = season_start + datetime.timedelta(days=28)
     late_cutoff = season_end - datetime.timedelta(days=28)
-    april_cutoff = datetime.date(season_year, 4, 30)
-    sept_cutoff = datetime.date(season_year, 9, 1)
+    april_cutoff = datetime.date(season_year, 5, 30)
+    sept_cutoff = datetime.date(season_year, 8, 1)
 
     early_late_div_series = 0
     div_pair_apr: Dict[Tuple[str, str], int] = {}
@@ -3091,8 +3104,8 @@ def evaluate_existing_schedule(
     print(f" 15. Long Homestands (>3 series) : {long_homestands} occurrences (Hard Constraint)")
     print(f" 16. 1-Series Road Trips (==1)   : {short_road_trips} occurrences (Soft Penalty)")
     print(f" 17. 1-Series Homestands (==1)   : {isolated_homestands} occurrences (Soft Penalty)")
-    print(f" 18. Missed April Div Matchups   : {len(missed_apr_list)} / 60 pairs {missed_apr_list[:8]}")
-    print(f" 19. Missed Sept Div Matchups    : {len(missed_sep_list)} / 60 pairs {missed_sep_list[:8]}")
+    print(f" 18. Missed April Div Matchups   : {len(missed_apr_list)} / 60 pairs {missed_apr_list}")
+    print(f" 19. Missed Sept Div Matchups    : {len(missed_sep_list)} / 60 pairs {missed_sep_list}")
     print(f" 20. ASG Core Games (Mon-Wed)    : {asg_core_games} games")
     print(f" 21. ASG Thursday Games          : {asg_thu_games} games (Soft Penalty)")
     print("-" * 76)
@@ -3156,7 +3169,7 @@ def main(
         parquet_path = os.path.join(output_dir, f"mlb_schedule.{season_year}.proposed.parquet")
         df_csv.to_parquet(parquet_path)
         evaluate_existing_schedule(df_csv, teams, dist_matrix, season_year=season_year, cfg=cfg)
-        # generate_team_schedule_pdfs(df_csv, teams, season_year=season_year, output_dir=output_dir, enable_logos=enable_logos, subtitle="proposed")
+        generate_team_schedule_pdfs(df_csv, teams, season_year=season_year, output_dir=output_dir, enable_logos=enable_logos, subtitle="proposed")
         return
 
     # Mode B: Full Two-Phase CP-SAT Schedule Optimization
