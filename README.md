@@ -6,11 +6,18 @@ c:\projects\MLB\research311\Scripts\python.exe -m pip install -r requirements.tx
 
 
 
+### 3rd party tool Poppler is installed here:
+# POPPLER_BIN = r"C:\Program Files\poppler-26.09.0\Library\bin"
+# Poppler is used to convert PDF to PNG which is easier to post on Reddit
+
+############################################################################################################
+
 c:; cd 'c:\projects\MLB'; & 'c:\projects\MLB\research311\Scripts\python.exe' 'C:\projects\MLB\mlb_scheduler.py'
 
 ###
 # generate constraint violation report for past years
 
+c:; cd 'c:\projects\MLB'; & 'c:\projects\MLB\research311\Scripts\python.exe' 'C:\projects\MLB\mlb_scheduler.py' '--evaluate-year=2000'
 c:; cd 'c:\projects\MLB'; & 'c:\projects\MLB\research311\Scripts\python.exe' 'C:\projects\MLB\mlb_scheduler.py' '--evaluate-year=2025'
 c:; cd 'c:\projects\MLB'; & 'c:\projects\MLB\research311\Scripts\python.exe' 'C:\projects\MLB\mlb_scheduler.py' '--evaluate-year=2026'
 c:; cd 'c:\projects\MLB'; & 'c:\projects\MLB\research311\Scripts\python.exe' 'C:\projects\MLB\mlb_scheduler.py' '--evaluate-year=2027'

@@ -28,9 +28,14 @@ from ortools.sat.python import cp_model
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.pdfgen import canvas
-
+from pdf2image import convert_from_path
+from PIL import Image
 
 from dataclasses import dataclass
+
+
+POPPLER_BIN = r"C:\Program Files\poppler-26.09.0\Library\bin"
+
 
 @dataclass
 class ScheduleConfig:
@@ -59,8 +64,8 @@ class ScheduleConfig:
     w_road_trip_start: int = -50
     w_missed_april_div: int = -2000
     w_missed_sept_div: int = -3000
-    w_div_31d_excess: int = -300
-    w_div_91d_gap: int = -300
+    w_div_31d_excess: int = -800
+    w_div_91d_gap: int = -600
     w_asg_thursday_game: int = -1000
     w_streak_over_threshold: int = -300       # Turned up to strongly suppress >9d playing streaks
     w_consec_dow_off: int = -150
@@ -1940,6 +1945,32 @@ def fetch_or_cache_team_logos(
     return logo_map
 
 
+def pdf_to_single_png(pdf_path, output_png_path, dpi=150):
+    # 1. Convert all 6 pages into a list of PIL Image objects
+    pages = convert_from_path(pdf_path, dpi=dpi, poppler_path=POPPLER_BIN)
+    
+    if not pages:
+        return
+
+    # 2. Grab dimensions (assuming all pages match the first page's size)
+    page_width, page_height = pages[0].size
+    
+    # 3. Calculate total height for all 6 pages stacked vertically
+    total_height = page_height * len(pages)
+    
+    # 4. Create a blank canvas large enough to hold everything
+    combined_image = Image.new("RGB", (page_width, total_height), color="white")
+    
+    # 5. Paste each page onto the master canvas, moving down after each page
+    current_y = 0
+    for page in pages:
+        combined_image.paste(page, (0, current_y))
+        current_y += page_height
+        
+    # 6. Save the final single stitched PNG
+    combined_image.save(output_png_path, "PNG")
+
+
 def generate_team_schedule_pdfs(
     df: pd.DataFrame,
     teams: List[Dict[str, Any]],
@@ -2254,6 +2285,9 @@ def generate_team_schedule_pdfs(
         for t in sorted(div_teams, key=lambda x: x["abbr"]):
             _render_team_page_on_canvas(c_div, t)
         c_div.save()
+
+        div_png_path = os.path.join(output_dir, f"mlb_schedule_{div_slug}_{season_year}_{subtitle}.png")
+        pdf_to_single_png(div_pdf_path, div_png_path)
 
     print(
         f"Generated 30 1-page team PDFs and {len(teams_by_div)} 5-page division PDFs in '{output_dir}/'."
